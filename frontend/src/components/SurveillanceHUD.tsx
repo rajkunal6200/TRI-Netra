@@ -573,9 +573,8 @@ export const SurveillanceHUD: React.FC<SurveillanceHUDProps> = ({
       sh = zoomedHeight;
     }
 
-    // Keep the camera's native detail up to 720p. The old 640x360 / 0.65
-    // export blurred faces before they reached detection and identity matching.
-    const scale = Math.min(1, 1280 / sw, 720 / sh);
+    // Preserve native detail up to 1080p for face verification and incident evidence.
+    const scale = Math.min(1, 1920 / sw, 1080 / sh);
     const outputWidth = Math.max(1, Math.round(sw * scale));
     const outputHeight = Math.max(1, Math.round(sh * scale));
     canvas.width = outputWidth;
@@ -583,7 +582,7 @@ export const SurveillanceHUD: React.FC<SurveillanceHUDProps> = ({
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(source, sx, sy, sw, sh, 0, 0, outputWidth, outputHeight);
-    return canvas.toDataURL('image/jpeg', 0.88);
+    return canvas.toDataURL('image/jpeg', 0.94);
   };
 
   // Capture frame for a specific camera channel
@@ -1047,8 +1046,8 @@ export const SurveillanceHUD: React.FC<SurveillanceHUDProps> = ({
     try {
       const constraints: MediaStreamConstraints = {
         video: requestedDeviceId
-          ? { deviceId: { exact: requestedDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-          : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          ? { deviceId: { exact: requestedDeviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+          : { width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       };
       let stream: MediaStream;
@@ -1057,7 +1056,10 @@ export const SurveillanceHUD: React.FC<SurveillanceHUDProps> = ({
       } catch (error) {
         if (!requestedDeviceId) throw error;
         // A saved device ID can expire; retry with the browser's default camera.
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: false,
+        });
       }
 
       const actualDeviceId = stream.getVideoTracks()[0]?.getSettings().deviceId;

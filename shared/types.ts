@@ -138,7 +138,7 @@ export interface SecurityIncident {
   threatLevel: ThreatLevel;
   title: string;
   description: string;
-  status: 'ACTIVE' | 'ACKNOWLEDGED' | 'RESOLVED' | 'DISMISSED';
+  status: 'ACTIVE' | 'ACKNOWLEDGED' | 'DISPATCHED' | 'RESOLVED' | 'DISMISSED' | 'FORENSIC_REVIEWED';
   capturedFrameUrl: string;
   croppedFaceUrl?: string;
   fullSceneFrameUrl?: string;

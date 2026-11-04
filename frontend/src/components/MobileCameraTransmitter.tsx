@@ -207,7 +207,7 @@ export const MobileCameraTransmitter: React.FC<MobileCameraTransmitterProps> = (
           if (ctx) {
             // Preserve enough facial detail for recognition and usable incident snapshots.
             // Never upscale cameras that provide a smaller frame.
-            const targetWidth = Math.min(1280, video.videoWidth);
+            const targetWidth = Math.min(1920, video.videoWidth);
             const scale = targetWidth / video.videoWidth;
             canvas.width = targetWidth;
             canvas.height = Math.round(video.videoHeight * scale);
@@ -258,7 +258,7 @@ export const MobileCameraTransmitter: React.FC<MobileCameraTransmitterProps> = (
                 }
               },
               'image/jpeg',
-              0.82
+              0.92
             );
 
             lastFrameTime = now;

@@ -48,8 +48,8 @@ export async function cropPersonPortrait(
           return;
         }
 
-        // Standardized square biometric mugshot output (minimum 280px for crisp forensic inspection)
-        const targetDimension = Math.max(280, Math.min(512, Math.round(Math.max(cropW, cropH))));
+        // Preserve more source detail from high-resolution frames for inspection.
+        const targetDimension = Math.max(280, Math.min(640, Math.round(Math.max(cropW, cropH))));
         const canvas = document.createElement('canvas');
         canvas.width = targetDimension;
         canvas.height = targetDimension;
@@ -85,7 +85,7 @@ export async function cropPersonPortrait(
         ctx.drawImage(img, cropX, cropY, cropW, cropH, destX, destY, drawW, drawH);
 
         // Optional subtle biometric crosshair watermark or vignette
-        const croppedDataUrl = canvas.toDataURL('image/jpeg', 0.90);
+        const croppedDataUrl = canvas.toDataURL('image/jpeg', 0.94);
         resolve(croppedDataUrl);
       } catch (err) {
         console.warn('Portrait isolation crop error:', err);

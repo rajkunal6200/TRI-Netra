@@ -75,6 +75,10 @@ export class RealtimeFaceTracker {
     return this.faceIdentityMatcher.registerEmbeddings(personId, embeddings);
   }
 
+  public static unregisterFaceEmbedding(personId: string): void {
+    this.faceIdentityMatcher.unregisterEmbedding(personId);
+  }
+
   public static matchFaceEmbedding(embedding: FaceEmbedding) {
     return this.faceIdentityMatcher.match(embedding);
   }
@@ -424,7 +428,7 @@ export class RealtimeFaceTracker {
     if (liveBoxes.length > 0) {
       const usedVerified = new Set<number>();
 
-      return liveBoxes.map((liveBox, i) => {
+      const liveFaces = liveBoxes.map((liveBox, i) => {
         const [ly1, lx1, ly2, lx2] = liveBox;
         const liveCenterX = (lx1 + lx2) / 2;
         const liveCenterY = (ly1 + ly2) / 2;
@@ -472,6 +476,12 @@ export class RealtimeFaceTracker {
           threatReason: 'A face was detected. Biometric verification is in progress.',
         };
       });
+
+      // The browser detector is optimized for fast foreground tracking and
+      // may miss smaller/background people found by the server scan. Keep all
+      // server-confirmed faces that were not paired with a live box.
+      const additionalVerifiedFaces = verifiedFaces.filter((_, index) => !usedVerified.has(index));
+      return [...liveFaces, ...additionalVerifiedFaces];
     }
 
     // Fallback to verified faces if optical detector didn't catch the live frame

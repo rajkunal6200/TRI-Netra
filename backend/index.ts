@@ -1,13 +1,17 @@
 import express from "express";
 import path from "path";
-import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { RealtimeFaceTracker } from "../shared/utils/realtimeFaceTracker";
 import { generateFaceDetections, generateSingleFaceEmbedding } from "./services/faceEmbeddingService";
-import { faceEmbeddingSimilarity } from "../shared/utils/faceIdentityMatcher";
+import {
+  FACE_IDENTITY_AUTHORIZATION_THRESHOLD,
+  FACE_IDENTITY_REVIEW_THRESHOLD,
+  faceEmbeddingSimilarity,
+} from "../shared/utils/faceIdentityMatcher";
 
 dotenv.config();
 if (process.argv.includes("--development")) {
@@ -22,6 +26,251 @@ if (process.argv.includes("--development")) {
 const trackingDataPath = path.resolve(process.env.TRINETRA_TRACKING_FILE || "backend/.local/tracking.json");
 const trackingDataTempPath = `${trackingDataPath}.tmp`;
 let trackingSaveTimer: NodeJS.Timeout | null = null;
+
+// Keep the authorized directory and its biometric templates on the server so
+// registrations remain available across browser sessions and server restarts.
+const personnelDataPath = path.resolve(process.env.TRINETRA_PERSONNEL_FILE || "backend/.local/personnel.json");
+const personnelDataTempPath = `${personnelDataPath}.tmp`;
+
+// Unauthorized detections have their own durable incident store. Image evidence
+// lives beside the JSON index so the incident list stays small and each photo
+// remains available for later dispatch or forensic review.
+const unauthorizedIncidentsPath = path.resolve(
+  process.env.TRINETRA_UNAUTHORIZED_INCIDENTS_FILE || "backend/.local/unauthorized-incidents.json"
+);
+const unauthorizedEvidenceDirectory = path.join(path.dirname(unauthorizedIncidentsPath), "unauthorized-evidence");
+const unauthorizedIncidentsTempPath = `${unauthorizedIncidentsPath}.tmp`;
+type StoredUnauthorizedIncident = {
+  incident: Record<string, any>;
+  portraitMime?: string;
+  sceneMime?: string;
+};
+
+function normalizeUnauthorizedIncident(value: any): Record<string, any> | null {
+  const hasConfirmedUnauthorizedFace = Array.isArray(value?.faces) && value.faces.some((face: any) =>
+    face?.status === "UNAUTHORIZED"
+  );
+  const hasUncertainFace = Array.isArray(value?.faces) && value.faces.some((face: any) =>
+    face?.status === "UNKNOWN" || face?.status === "SUSPICIOUS"
+  );
+  const isUnauthorized = value?.category === "BIOMETRIC_BREACH" || value?.category === "IDENTITY_REVIEW" ||
+    (Array.isArray(value?.faces) && value.faces.some((face: any) =>
+      face?.status === "UNAUTHORIZED" || face?.status === "SUSPICIOUS" || face?.status === "UNKNOWN"
+    ));
+  if (
+    !isUnauthorized || !value || typeof value !== "object" || Array.isArray(value) ||
+    typeof value.id !== "string" || !value.id.trim() || value.id.length > 128 ||
+    typeof value.timestamp !== "string" || typeof value.title !== "string" ||
+    typeof value.zone !== "string" || typeof value.description !== "string" ||
+    !Array.isArray(value.faces) || value.faces.length > 20
+  ) return null;
+
+  const faces = value.faces.map((face: any) => {
+    if (!face || typeof face !== "object" || Array.isArray(face)) return null;
+    const { croppedFaceUrl: _croppedFaceUrl, ...savedFace } = face;
+    return savedFace;
+  });
+  if (faces.some((face: unknown) => face === null)) return null;
+
+  const { capturedFrameUrl: _capturedFrameUrl, croppedFaceUrl: _croppedFaceUrl,
+    fullSceneFrameUrl: _fullSceneFrameUrl, ...metadata } = value;
+  const status = ["ACTIVE", "ACKNOWLEDGED", "DISPATCHED", "RESOLVED", "DISMISSED", "FORENSIC_REVIEWED"].includes(value.status)
+    ? value.status
+    : "ACTIVE";
+  return {
+    ...metadata,
+    category: hasConfirmedUnauthorizedFace
+      ? "BIOMETRIC_BREACH"
+      : value.category === "BIOMETRIC_BREACH" && !hasUncertainFace ? "BIOMETRIC_BREACH" : "IDENTITY_REVIEW",
+    status,
+    faces,
+    ...(Array.isArray(value.locationHistory)
+      ? { locationHistory: value.locationHistory.map((crumb: any) => {
+          if (!crumb || typeof crumb !== "object") return crumb;
+          const { capturedFrameUrl: _capturedFrameUrl, ...savedCrumb } = crumb;
+          return savedCrumb;
+        }) }
+      : {}),
+  };
+}
+
+function getFaceMaskOrBlurKind(face: any): "mask" | "blur" | null {
+  const visibilityStatus = String(face?.visibilityStatus || "").toUpperCase();
+  if (visibilityStatus === "BLURRY") return "blur";
+
+  // Use explicit concealment/blur descriptions only. Generic low-quality text
+  // such as "may indicate blur" must not turn every uncertain face into an alert.
+  const description = `${face?.visibilityReason || ""} ${face?.threatReason || ""}`.toLowerCase();
+  if (/\b(blurry|blurred|out[\s-]of[\s-]focus|motion[\s-]blur)\b/.test(description)) return "blur";
+  if (/\b(mask(?:ed|ing)?|balaclava|face covering|covered face)\b/.test(description)) return "mask";
+  return null;
+}
+
+function unauthorizedEvidencePath(id: string, kind: "portrait" | "scene"): string {
+  const stableId = createHash("sha256").update(id).digest("hex");
+  return path.join(unauthorizedEvidenceDirectory, `${stableId}-${kind}.image`);
+}
+
+function saveUnauthorizedEvidence(id: string, kind: "portrait" | "scene", value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/^data:(image\/(?:jpeg|png|webp));base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) return undefined;
+  const data = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+  if (data.length === 0 || data.length > 15 * 1024 * 1024) {
+    throw new Error("Incident evidence image must be smaller than 15 MB.");
+  }
+  mkdirSync(unauthorizedEvidenceDirectory, { recursive: true, mode: 0o700 });
+  const evidencePath = unauthorizedEvidencePath(id, kind);
+  const tempPath = `${evidencePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(tempPath, data, { mode: 0o600 });
+  renameSync(tempPath, evidencePath);
+  return match[1].toLowerCase();
+}
+
+function persistUnauthorizedIncidents(incidents: StoredUnauthorizedIncident[]): void {
+  mkdirSync(path.dirname(unauthorizedIncidentsPath), { recursive: true, mode: 0o700 });
+  writeFileSync(unauthorizedIncidentsTempPath, JSON.stringify({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    incidents,
+  }), { mode: 0o600 });
+  renameSync(unauthorizedIncidentsTempPath, unauthorizedIncidentsPath);
+}
+
+function incidentWithEvidence(record: StoredUnauthorizedIncident): Record<string, any> {
+  const { incident } = record;
+  const id = encodeURIComponent(incident.id);
+  const portraitUrl = existsSync(unauthorizedEvidencePath(incident.id, "portrait"))
+    ? `/api/incidents/unauthorized/${id}/evidence/portrait`
+    : undefined;
+  const sceneUrl = existsSync(unauthorizedEvidencePath(incident.id, "scene"))
+    ? `/api/incidents/unauthorized/${id}/evidence/scene`
+    : undefined;
+  return {
+    ...incident,
+    capturedFrameUrl: portraitUrl || "",
+    ...(portraitUrl ? { croppedFaceUrl: portraitUrl } : {}),
+    ...(sceneUrl ? { fullSceneFrameUrl: sceneUrl } : {}),
+    faces: incident.faces.map((face: any, index: number) => index === 0 && portraitUrl
+      ? { ...face, croppedFaceUrl: portraitUrl }
+      : face),
+  };
+}
+
+let savedUnauthorizedIncidents: StoredUnauthorizedIncident[] = [];
+try {
+  mkdirSync(path.dirname(unauthorizedIncidentsPath), { recursive: true, mode: 0o700 });
+  if (existsSync(unauthorizedIncidentsPath)) {
+    const saved = JSON.parse(readFileSync(unauthorizedIncidentsPath, "utf8"));
+    if (saved?.version === 1 && Array.isArray(saved.incidents)) {
+      savedUnauthorizedIncidents = saved.incidents.flatMap((candidate: any) => {
+        const incident = normalizeUnauthorizedIncident(candidate?.incident);
+        return incident
+          ? [{ incident, ...(typeof candidate.portraitMime === "string" ? { portraitMime: candidate.portraitMime } : {}),
+              ...(typeof candidate.sceneMime === "string" ? { sceneMime: candidate.sceneMime } : {}) }]
+          : [];
+      });
+    }
+  }
+} catch (error) {
+  console.warn("Could not load the unauthorized incident database:", error instanceof Error ? error.message : error);
+}
+
+type StoredPersonnel = {
+  id: string;
+  name: string;
+  role: string;
+  department: string;
+  clearanceLevel: string;
+  photoUrl: string;
+  description: string;
+  registeredAt: string;
+  accessZones: string[];
+  faceEmbedding?: number[];
+  faceEmbeddings?: number[][];
+  notes?: string;
+  keyBiometrics?: string[];
+};
+
+function normalizeStoredPersonnel(value: any): StoredPersonnel | null {
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    typeof value.id !== "string" || !value.id.trim() || value.id.length > 128 ||
+    typeof value.name !== "string" || !value.name.trim() || value.name.length > 200 ||
+    typeof value.role !== "string" || value.role.length > 200 ||
+    typeof value.department !== "string" || value.department.length > 200 ||
+    typeof value.clearanceLevel !== "string" || value.clearanceLevel.length > 100 ||
+    (value.photoUrl !== undefined && (typeof value.photoUrl !== "string" || value.photoUrl.length > 10 * 1024 * 1024)) ||
+    (value.description !== undefined && (typeof value.description !== "string" || value.description.length > 2_000)) ||
+    (value.registeredAt !== undefined && typeof value.registeredAt !== "string") ||
+    (value.accessZones !== undefined && (!Array.isArray(value.accessZones) || value.accessZones.length > 100 ||
+      !value.accessZones.every((zone: unknown) => typeof zone === "string" && zone.length <= 200))) ||
+    (value.notes !== undefined && (typeof value.notes !== "string" || value.notes.length > 2_000)) ||
+    (value.keyBiometrics !== undefined && (!Array.isArray(value.keyBiometrics) || value.keyBiometrics.length > 50 ||
+      !value.keyBiometrics.every((item: unknown) => typeof item === "string" && item.length <= 200))) ||
+    (value.faceEmbedding !== undefined && !isValidStoredEmbedding(value.faceEmbedding)) ||
+    (value.faceEmbeddings !== undefined && (!Array.isArray(value.faceEmbeddings) || value.faceEmbeddings.length > 5 ||
+      !value.faceEmbeddings.every(isValidStoredEmbedding)))
+  ) return null;
+
+  const embeddings = Array.isArray(value.faceEmbeddings) && value.faceEmbeddings.length > 0
+    ? value.faceEmbeddings
+    : value.faceEmbedding !== undefined ? [value.faceEmbedding] : [];
+
+  return {
+    id: value.id.trim(),
+    name: value.name.trim(),
+    role: value.role || "Authorized Personnel",
+    department: value.department || "Unassigned",
+    clearanceLevel: value.clearanceLevel || "Level 1 - Visitor",
+    photoUrl: value.photoUrl || "",
+    description: value.description || "",
+    registeredAt: value.registeredAt || new Date().toISOString(),
+    accessZones: Array.isArray(value.accessZones) ? value.accessZones : [],
+    ...(embeddings.length > 0 ? { faceEmbedding: embeddings[0], faceEmbeddings: embeddings } : {}),
+    ...(typeof value.notes === "string" ? { notes: value.notes } : {}),
+    ...(Array.isArray(value.keyBiometrics) ? { keyBiometrics: value.keyBiometrics } : {}),
+  };
+}
+
+function isValidStoredEmbedding(value: unknown): value is number[] {
+  return Array.isArray(value) && value.length === 1024 &&
+    value.every((item: unknown) => typeof item === "number" && Number.isFinite(item)) &&
+    value.some((item: number) => item !== 0);
+}
+
+let savedPersonnel: StoredPersonnel[] = [];
+try {
+  mkdirSync(path.dirname(personnelDataPath), { recursive: true, mode: 0o700 });
+  if (existsSync(personnelDataPath)) {
+    const saved = JSON.parse(readFileSync(personnelDataPath, "utf8"));
+    if (saved?.version === 1 && Array.isArray(saved.personnel)) {
+      const restored: StoredPersonnel[] = [];
+      const seenIds = new Set<string>();
+      for (const candidate of saved.personnel) {
+        const person = normalizeStoredPersonnel(candidate);
+        if (!person || seenIds.has(person.id)) continue;
+        seenIds.add(person.id);
+        restored.push(person);
+        const embeddings = person.faceEmbeddings?.length ? person.faceEmbeddings : person.faceEmbedding ? [person.faceEmbedding] : [];
+        if (embeddings.length > 0) RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings);
+      }
+      savedPersonnel = restored;
+    }
+  }
+} catch (error) {
+  console.warn("Could not load the saved authorized personnel directory:", error instanceof Error ? error.message : error);
+}
+
+function persistPersonnelData(personnel: StoredPersonnel[]): void {
+  mkdirSync(path.dirname(personnelDataPath), { recursive: true, mode: 0o700 });
+  writeFileSync(personnelDataTempPath, JSON.stringify({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    personnel,
+  }), { mode: 0o600 });
+  renameSync(personnelDataTempPath, personnelDataPath);
+}
 
 try {
   mkdirSync(path.dirname(trackingDataPath), { recursive: true, mode: 0o700 });
@@ -115,6 +364,10 @@ function stabilizeAuthorizedCameraFaces(
 
   const stabilizedFaces = faces.map((face) => {
     if (face?.status !== "UNKNOWN" || !Array.isArray(face.embedding) || !Array.isArray(face.box_2d)) return face;
+    if (
+      face.isProperlyVisible === false ||
+      ["OCCLUDED", "BLURRY", "PARTIAL", "NOT_PROPERLY_VISIBLE"].includes(face.visibilityStatus)
+    ) return face;
     const faceWidth = Math.max(0, face.box_2d[3] - face.box_2d[1]) * frameWidth / 1000;
     const faceHeight = Math.max(0, face.box_2d[2] - face.box_2d[0]) * frameHeight / 1000;
     if (face.confidence < MIN_VERIFIED_FACE_QUALITY * 100 || Math.min(faceWidth, faceHeight) < MIN_VERIFIED_FACE_PIXELS) {
@@ -122,7 +375,7 @@ function stabilizeAuthorizedCameraFaces(
     }
 
     const profileCandidate = RealtimeFaceTracker.findBestFaceEmbeddingMatch(face.embedding);
-    if (!profileCandidate || profileCandidate.similarity < 0.4) return face;
+    if (!profileCandidate || profileCandidate.similarity < FACE_IDENTITY_AUTHORIZATION_THRESHOLD - 0.05) return face;
     const person = personnel.find((candidate: any) => candidate?.id === profileCandidate.personId);
     if (!person) return face;
 
@@ -131,7 +384,7 @@ function stabilizeAuthorizedCameraFaces(
         !consumedTrackIds.has(track.id) &&
         track.personId === person.id &&
         faceBoxesContinueSameTrack(face.box_2d, track.box) &&
-        (faceEmbeddingSimilarity(face.embedding, track.embedding) ?? 0) >= 0.4
+        (faceEmbeddingSimilarity(face.embedding, track.embedding) ?? 0) >= 0.65
       )
       .sort((left, right) => right.lastSeenAt - left.lastSeenAt)[0];
 
@@ -421,6 +674,152 @@ async function startServer() {
     }
 
     return res.json(RealtimeFaceTracker.getDailyTrackingPresence(date));
+  });
+
+  app.get("/api/incidents/unauthorized/:id/evidence/:kind", (req, res) => {
+    const id = req.params.id;
+    const kind = req.params.kind;
+    if ((kind !== "portrait" && kind !== "scene") || !savedUnauthorizedIncidents.some(({ incident }) => incident.id === id)) {
+      return res.status(404).json({ error: "Incident evidence not found." });
+    }
+    const evidencePath = unauthorizedEvidencePath(id, kind);
+    if (!existsSync(evidencePath)) return res.status(404).json({ error: "Incident evidence not found." });
+    const record = savedUnauthorizedIncidents.find(({ incident }) => incident.id === id);
+    const mimeType = kind === "portrait" ? record?.portraitMime : record?.sceneMime;
+    res.setHeader("Content-Type", mimeType || "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=60");
+    return res.send(readFileSync(evidencePath));
+  });
+
+  app.get("/api/incidents/unauthorized", (_req, res) => {
+    return res.json({ incidents: savedUnauthorizedIncidents.map(incidentWithEvidence) });
+  });
+
+  app.post("/api/incidents/unauthorized", (req, res) => {
+    const candidate = req.body?.incident;
+    const incident = normalizeUnauthorizedIncident(candidate);
+    if (!incident) return res.status(400).json({ error: "Invalid unauthorized incident." });
+
+    const existingIndex = savedUnauthorizedIncidents.findIndex(({ incident: saved }) => saved.id === incident.id);
+    const existingRecord = existingIndex >= 0 ? savedUnauthorizedIncidents[existingIndex] : undefined;
+    try {
+      const portraitSource = candidate.croppedFaceUrl || candidate.faces?.[0]?.croppedFaceUrl || candidate.capturedFrameUrl;
+      const portraitMime = saveUnauthorizedEvidence(incident.id, "portrait", portraitSource) || existingRecord?.portraitMime;
+      const sceneMime = saveUnauthorizedEvidence(incident.id, "scene", candidate.fullSceneFrameUrl) || existingRecord?.sceneMime;
+      const nextRecord: StoredUnauthorizedIncident = {
+        incident,
+        ...(portraitMime ? { portraitMime } : {}),
+        ...(sceneMime ? { sceneMime } : {}),
+      };
+      const nextIncidents = [...savedUnauthorizedIncidents];
+      if (existingIndex >= 0) nextIncidents[existingIndex] = nextRecord;
+      else nextIncidents.unshift(nextRecord);
+      persistUnauthorizedIncidents(nextIncidents);
+      savedUnauthorizedIncidents = nextIncidents;
+      return res.json({ success: true, incident: incidentWithEvidence(nextRecord) });
+    } catch (error) {
+      console.error("Could not save the unauthorized incident:", error);
+      return res.status(500).json({ error: error instanceof Error ? error.message : "Could not save the unauthorized incident." });
+    }
+  });
+
+  app.delete("/api/incidents/unauthorized/:id", (req, res) => {
+    const id = req.params.id;
+    const nextIncidents = savedUnauthorizedIncidents.filter(({ incident }) => incident.id !== id);
+    if (nextIncidents.length === savedUnauthorizedIncidents.length) return res.json({ success: true, removed: false });
+    try {
+      persistUnauthorizedIncidents(nextIncidents);
+      savedUnauthorizedIncidents = nextIncidents;
+      for (const kind of ["portrait", "scene"] as const) {
+        const evidencePath = unauthorizedEvidencePath(id, kind);
+        if (existsSync(evidencePath)) unlinkSync(evidencePath);
+      }
+      return res.json({ success: true, removed: true });
+    } catch (error) {
+      console.error("Could not delete the unauthorized incident:", error);
+      return res.status(500).json({ error: "Could not delete the unauthorized incident." });
+    }
+  });
+
+  app.delete("/api/incidents/unauthorized", (_req, res) => {
+    try {
+      persistUnauthorizedIncidents([]);
+      for (const { incident } of savedUnauthorizedIncidents) {
+        for (const kind of ["portrait", "scene"] as const) {
+          const evidencePath = unauthorizedEvidencePath(incident.id, kind);
+          if (existsSync(evidencePath)) unlinkSync(evidencePath);
+        }
+      }
+      savedUnauthorizedIncidents = [];
+      return res.json({ success: true });
+    } catch (error) {
+      console.error("Could not clear the unauthorized incident database:", error);
+      return res.status(500).json({ error: "Could not clear the unauthorized incident database." });
+    }
+  });
+
+  app.get("/api/personnel", (_req, res) => {
+    return res.json({ personnel: savedPersonnel });
+  });
+
+  app.post("/api/personnel", (req, res) => {
+    const person = normalizeStoredPersonnel(req.body?.person);
+    if (!person) return res.status(400).json({ error: "Invalid personnel profile." });
+
+    const nextPersonnel = [person, ...savedPersonnel.filter((candidate) => candidate.id !== person.id)];
+    try {
+      persistPersonnelData(nextPersonnel);
+    } catch (error) {
+      console.error("Could not save the authorized personnel profile:", error);
+      return res.status(500).json({ error: "Could not save the authorized personnel profile." });
+    }
+
+    const embeddings = person.faceEmbeddings?.length ? person.faceEmbeddings : person.faceEmbedding ? [person.faceEmbedding] : [];
+    if (embeddings.length > 0) RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings);
+    savedPersonnel = nextPersonnel;
+    return res.json({ success: true, count: savedPersonnel.length });
+  });
+
+  app.put("/api/personnel", (req, res) => {
+    const input = req.body?.personnel;
+    if (!Array.isArray(input) || input.length > 500) {
+      return res.status(400).json({ error: "Invalid authorized-personnel directory." });
+    }
+
+    const nextPersonnel: StoredPersonnel[] = [];
+    const seenIds = new Set<string>();
+    for (const candidate of input) {
+      const person = normalizeStoredPersonnel(candidate);
+      if (!person || seenIds.has(person.id)) {
+        return res.status(400).json({ error: "Each directory entry needs a unique ID and valid profile fields." });
+      }
+      seenIds.add(person.id);
+      nextPersonnel.push(person);
+    }
+
+    try {
+      persistPersonnelData(nextPersonnel);
+    } catch (error) {
+      console.error("Could not save the authorized personnel directory:", error);
+      return res.status(500).json({ error: "Could not save the authorized personnel directory." });
+    }
+
+    const nextIds = new Set(nextPersonnel.map((person) => person.id));
+    for (const previousPerson of savedPersonnel) {
+      if (!nextIds.has(previousPerson.id)) RealtimeFaceTracker.unregisterFaceEmbedding(previousPerson.id);
+    }
+    for (const person of nextPersonnel) {
+      const embeddings = person.faceEmbeddings?.length ? person.faceEmbeddings : person.faceEmbedding ? [person.faceEmbedding] : [];
+      if (embeddings.length > 0) {
+        if (!RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings)) {
+          RealtimeFaceTracker.unregisterFaceEmbedding(person.id);
+        }
+      } else {
+        RealtimeFaceTracker.unregisterFaceEmbedding(person.id);
+      }
+    }
+    savedPersonnel = nextPersonnel;
+    return res.json({ success: true, count: savedPersonnel.length });
   });
 
   app.post("/api/tracking/register-embedding", (req, res) => {
@@ -1184,7 +1583,6 @@ async function startServer() {
 
         const widthA = x2A - x1A;
         const widthB = x2B - x1B;
-        const heightB = y2B - y1B;
         const minDimension = Math.min(widthA, widthB, y2A - y1A, y2B - y1B);
 
         // Deduplicate boxes ONLY if they are truly identical duplicate boxes for the exact same face.
@@ -1201,21 +1599,13 @@ async function startServer() {
           continue;
         }
 
-        // 2. High overlap required for duplicate face detection: IoU > 0.65 or near-total containment > 0.85
-        // with closely aligned centers (centerDist < minDimension * 0.30)
+        // Remove only near-identical boxes. Two people standing close together
+        // can have substantially overlapping face boxes in a crowded frame.
         const isTrueDuplicate =
-          iou > 0.65 ||
-          (containment > 0.85 && centerDist < Math.max(10, minDimension * 0.35));
+          iou > 0.9 && centerDist < Math.max(8, minDimension * 0.12) ||
+          containment > 0.97 && centerDist < Math.max(6, minDimension * 0.08);
 
-        // 3. Artifact detection: only drop if it is clearly a torso/clothing box directly below
-        // with huge vertical shift and nearly identical horizontal column
-        const isTorsoArtifact =
-          y1A >= y2B - 10 &&
-          y2A > y2B + heightB * 0.5 &&
-          Math.abs(centerAX - centerBX) < Math.max(widthB * 0.4, 20) &&
-          containment > 0.45;
-
-        if (isTrueDuplicate || isTorsoArtifact) {
+        if (isTrueDuplicate) {
           isDup = true;
           break;
         }
@@ -1242,21 +1632,37 @@ async function startServer() {
         channelId,
         pairCode = "PHONE-1",
       } = req.body;
-      const authorizedPersonnel = Array.isArray(requestPersonnel) ? requestPersonnel : [];
+      const authorizedPersonnel = Array.isArray(requestPersonnel)
+        ? requestPersonnel.map((person: any) => {
+          if (!person || typeof person.id !== "string") return person;
+          const storedProfile = savedPersonnel.find((candidate) => candidate.id === person.id);
+          return storedProfile
+            ? {
+                ...storedProfile,
+                ...person,
+                faceEmbedding: storedProfile.faceEmbedding,
+                faceEmbeddings: storedProfile.faceEmbeddings,
+              }
+            : person;
+        })
+        : [];
       const normalizedSecurityLevel = typeof securityLevel === "string" ? securityLevel.toUpperCase() : "STANDARD";
       const isRestrictedZone = /server|vault|control room|research lab|substation/i.test(String(currentZone)) ||
         normalizedSecurityLevel === "HIGH_SECURITY" || normalizedSecurityLevel === "MAXIMUM_RESTRICTION";
       const unmatchedThreatLevel = isRestrictedZone ? "HIGH" : "MEDIUM";
-      const nearMatchReviewThreshold = 0.4;
       for (const person of authorizedPersonnel) {
-        if (
-          person && typeof person.id === "string" &&
-          Array.isArray(person.faceEmbedding) && person.faceEmbedding.length === 1024 &&
-          person.faceEmbedding.every((value: unknown) => typeof value === "number" && Number.isFinite(value))
-        ) {
-          RealtimeFaceTracker.registerFaceEmbedding(person.id, person.faceEmbedding);
-        }
+        if (!person || typeof person.id !== "string") continue;
+        const embeddings = Array.isArray(person.faceEmbeddings)
+          ? person.faceEmbeddings
+          : Array.isArray(person.faceEmbedding) ? [person.faceEmbedding] : [];
+        if (embeddings.length > 0) RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings);
       }
+      const hasIncompleteDirectoryBiometrics = authorizedPersonnel.some((person: any) => {
+        const embeddings = Array.isArray(person?.faceEmbeddings)
+          ? person.faceEmbeddings
+          : Array.isArray(person?.faceEmbedding) ? [person.faceEmbedding] : [];
+        return !embeddings.some(isValidStoredEmbedding);
+      });
 
       let cleanBase64 = "";
       let mimeType = "image/jpeg";
@@ -1462,8 +1868,10 @@ CRITICAL BIOMETRIC VERIFICATION & DETECTION RULES:
    - The authorized directory supplied with this request is the source of truth. Do not use a hardcoded or remembered list of names.
    - Set status: "AUTHORIZED" only when a clear face definitively matches a supplied reference profile.
    - Facility access policy allows only people in this directory. A clear, high-quality face with no profile match is "UNAUTHORIZED" with matchedPersonnelId: null and matchedName: "UNREGISTERED INDIVIDUAL".
-   - Use status: "UNKNOWN" and matchedName: "UNVERIFIED SUBJECT" when the face is blurry, partial, distant, too small, or biometric matching is ambiguous. Blur, lighting, camera angle, and an object accidentally blocking the view are not proof of an intrusion.
-   - If any required facial identity region is visibly covered or occluded, set status: "UNAUTHORIZED" with matchedPersonnelId: null and matchedName: "UNAUTHORIZED — FACE COVERED". Do this even if the visible upper face resembles an authorized profile; biometric similarity cannot override visible occlusion.
+   - Treat a visible face mask/face covering or an explicitly BLURRY face as UNAUTHORIZED under this facility's access policy. Keep the face in the frame and explain whether a mask or blur was detected.
+   - Use status: "UNKNOWN" and matchedName: "UNVERIFIED SUBJECT" when the face is partial, distant, too small, turned away, or biometric matching is ambiguous for reasons other than an explicit mask or blur.
+   - If a person is facing away and their face is not visible, include an UNKNOWN head-region box with isProperlyVisible: false and visibilityStatus: "NOT_PROPERLY_VISIBLE". State "Back to camera; identity unverified." Never identify or authorize someone from the back of their head.
+   - If the face is covered by a mask/face covering or explicitly blurry, use status: "UNAUTHORIZED". Keep a person facing away or a merely distant/partial face as UNKNOWN unless a mask or blur is explicitly visible.
    - Do not infer dangerous behavior from identity mismatch alone. A confirmed unmatched person is a perimeter/access alert; reserve CRITICAL for clearly described imminent or active breach behavior.
    - Threat severity describes observable security risk, not face presence: routine identity review is LOW; a confirmed unmatched person in a standard zone is MEDIUM; confirmed unauthorized presence in a restricted zone is HIGH; reserve CRITICAL for clearly described imminent or active breach behavior.
    - If Person A is AUTHORIZED and Person B is UNKNOWN or UNAUTHORIZED, output TWO separate boxes with their respective statuses.
@@ -1493,9 +1901,10 @@ ${JSON.stringify(authorizedListSummary, null, 2)}
 DETECTION DIRECTIVES:
 1. DYNAMIC FACE-SIZED BOXES: Box size MUST match face size. Forehead to chin, cheek to cheek only (NO neck, shoulders, or clothing).
 2. DETECT ALL FACES (FOREGROUND + FAR BACKGROUND): Scan the entire field of view, including any distant people sitting or standing in the background (desks, walkways, doors). Detect foreground and background subjects simultaneously!
-3. CAREFUL IDENTITY VERIFICATION: Only mark a face AUTHORIZED after a confident match to the supplied directory and when the required facial identity regions are visible. A clear face with no directory match is UNAUTHORIZED under this facility's access policy. Any face with required identity regions covered or occluded is UNAUTHORIZED, even if its visible upper face resembles an authorized person. Use UNKNOWN only when image quality/matching evidence is insufficient and there is no visible covering.
-4. VISIBILITY ASSESSMENT: Set isProperlyVisible (true/false) and visibilityStatus ("CLEAR" | "PARTIAL" | "BLURRY" | "OCCLUDED" | "NOT_PROPERLY_VISIBLE"). Explain whether occlusion looks accidental, medical/PPE, or deliberate concealment.
-5. Return detectedFaces with precise [ymin, xmin, ymax, xmax] (0-1000) for all individuals.`;
+3. CAREFUL IDENTITY VERIFICATION: Only mark a face AUTHORIZED after a confident match to the supplied directory. Under this facility's access policy, a visible mask/face covering or an explicitly BLURRY face is UNAUTHORIZED. A clear unmatched face is also UNAUTHORIZED when biometric evidence is sufficient and no registered profile is a plausible match. Keep a merely partial, distant, turned-away, or ambiguous face UNKNOWN unless a mask or blur is explicitly visible.
+4. If a person is facing away and their face is not visible, include an UNKNOWN head-region box with isProperlyVisible: false and visibilityStatus: "NOT_PROPERLY_VISIBLE". State "Back to camera; identity unverified." Do not infer identity from hair, clothing, or the back of their head.
+5. VISIBILITY ASSESSMENT: Set isProperlyVisible (true/false) and visibilityStatus ("CLEAR" | "PARTIAL" | "BLURRY" | "OCCLUDED" | "NOT_PROPERLY_VISIBLE"). Explain whether occlusion looks accidental, medical/PPE, or deliberate concealment.
+6. Return detectedFaces with precise [ymin, xmin, ymax, xmax] (0-1000) for all individuals.`;
 
       // Build multimodal contents payload with reference portraits + live frame
       const contentParts: any[] = [];
@@ -1562,7 +1971,7 @@ DETECTION DIRECTIVES:
                     },
                     status: {
                       type: Type.STRING,
-                      description: "AUTHORIZED, UNKNOWN (identity needs review), UNAUTHORIZED (clear unmatched face under access policy), or SUSPICIOUS (intentional identity concealment or other observable security behavior)",
+                      description: "AUTHORIZED, UNKNOWN (partial/distant/turned-away or ambiguous identity), UNAUTHORIZED (clear unmatched face, visible mask/face covering, or explicitly blurry face under access policy), or SUSPICIOUS (other observable security behavior)",
                     },
                     matchedPersonnelId: {
                       type: Type.STRING,
@@ -1585,7 +1994,7 @@ DETECTION DIRECTIVES:
                     },
                     visibilityStatus: {
                       type: Type.STRING,
-                      description: "CLEAR, PARTIAL, BLURRY, or OCCLUDED",
+                      description: "CLEAR, PARTIAL, BLURRY, OCCLUDED, or NOT_PROPERLY_VISIBLE",
                     },
                   },
                   required: ["box_2d", "status", "confidence", "threatLevel", "threatReason"],
@@ -1818,11 +2227,9 @@ DETECTION DIRECTIVES:
             const isFaceOccluded = detection.occludedByHand === true;
             const faceHasEnoughPixels = Math.min(detection.box[2], detection.box[3]) >= MIN_VERIFIED_FACE_PIXELS;
             const identityQualityIsSufficient = detection.confidence >= MIN_VERIFIED_FACE_QUALITY && faceHasEnoughPixels;
-            // Face mesh quality is useful for visibility warnings, but it can
-            // dip on a clear face at an angle. Let the biometric descriptor
-            // decide identity whenever there are enough source pixels; the
-            // stricter similarity threshold still protects the match.
-            const canAttemptBiometricMatch = faceHasEnoughPixels && Boolean(detection.embedding);
+            // Do not authorize from an unclear crop, even if its descriptor
+            // happens to be close to an enrolled face.
+            const canAttemptBiometricMatch = identityQualityIsSufficient && Boolean(detection.embedding);
             const match = !isFaceOccluded && canAttemptBiometricMatch && detection.embedding
               ? RealtimeFaceTracker.matchFaceEmbedding(detection.embedding)
               : null;
@@ -1833,10 +2240,11 @@ DETECTION DIRECTIVES:
               ? authorizedPersonnel.find((candidate: any) => candidate?.id === match.personId)
               : undefined;
             const isAuthorized = Boolean(match && person);
-            const isClearUnmatchedFace = !isFaceOccluded && !isAuthorized && identityQualityIsSufficient && Boolean(detection.embedding);
-            const hasAmbiguousDirectoryMatch = Boolean(bestCandidate && bestCandidate.similarity >= nearMatchReviewThreshold);
-            const isUnauthorized = isClearUnmatchedFace && !hasAmbiguousDirectoryMatch;
-            const faceStatus = isFaceOccluded ? "UNAUTHORIZED" : isAuthorized ? "AUTHORIZED" : isUnauthorized ? "UNAUTHORIZED" : "UNKNOWN";
+            const isClearUnmatchedFace = !isFaceOccluded && !isAuthorized && identityQualityIsSufficient && !hasIncompleteDirectoryBiometrics;
+            const isNearRegisteredPerson = Boolean(bestCandidate && bestCandidate.similarity >= FACE_IDENTITY_REVIEW_THRESHOLD);
+            const needsIdentityReview = isClearUnmatchedFace && isNearRegisteredPerson;
+            const isUnauthorized = isClearUnmatchedFace && !needsIdentityReview;
+            const faceStatus = isFaceOccluded ? "UNKNOWN" : isAuthorized ? "AUTHORIZED" : isUnauthorized ? "UNAUTHORIZED" : "UNKNOWN";
             return {
               id: `local-face-${index}-${box_2d.join("-")}`,
               box_2d,
@@ -1844,13 +2252,21 @@ DETECTION DIRECTIVES:
               ...(isFaceOccluded ? { isHandOccluded: true } : {}),
               status: faceStatus,
               matchedPersonnelId: isAuthorized && !isFaceOccluded ? person.id : null,
-              matchedName: isFaceOccluded ? "UNAUTHORIZED — FACE COVERED" : isAuthorized ? person.name : isUnauthorized ? "UNREGISTERED INDIVIDUAL" : "UNVERIFIED SUBJECT",
-              confidence: isAuthorized ? Math.round(match!.similarity * 100) : Math.round(detection.confidence * 100),
-              threatLevel: isFaceOccluded ? "HIGH" : isUnauthorized ? unmatchedThreatLevel : isAuthorized ? "NONE" : "LOW",
+              matchedName: isFaceOccluded
+                ? "IDENTITY REVIEW — FACE OCCLUDED"
+                : isAuthorized ? person.name
+                : needsIdentityReview ? "POSSIBLE DIRECTORY MATCH"
+                : isUnauthorized ? "UNREGISTERED INDIVIDUAL" : "UNVERIFIED SUBJECT",
+              confidence: isAuthorized
+                ? Math.round(match!.similarity * 100)
+                : needsIdentityReview ? Math.round((bestCandidate?.similarity || 0) * 100) : Math.round(detection.confidence * 100),
+              threatLevel: isFaceOccluded ? "LOW" : isUnauthorized ? unmatchedThreatLevel : isAuthorized ? "NONE" : "LOW",
               threatReason: isFaceOccluded
-                ? `Access policy: the nose/mouth identity region is covered in ${currentZone}; the face is classified as unauthorized and biometric matching is blocked.`
+                ? `Facial identity is occluded in ${currentZone}; authorization remains unverified and requires manual review.`
                 : isAuthorized
                 ? `Local biometric match confirmed for ${person.name}.`
+                : needsIdentityReview
+                  ? "This clear face is similar to an enrolled profile but did not meet the authorization threshold. Manual verification is required."
                 : isUnauthorized
                   ? `Clear face did not match an enrolled person. Unauthorized access is not permitted in ${currentZone}.`
                 : detection.embedding
@@ -1862,7 +2278,7 @@ DETECTION DIRECTIVES:
               isProperlyVisible: identityQualityIsSufficient && !isFaceOccluded,
               visibilityStatus: isFaceOccluded ? "OCCLUDED" : identityQualityIsSufficient ? "CLEAR" : "PARTIAL",
               visibilityReason: isFaceOccluded
-                ? "A detected hand covers the central nose/mouth identity region; access policy classifies this face as unauthorized."
+                ? "A detected hand covers part of the face; this is insufficient evidence to classify the person as unauthorized."
                 : identityQualityIsSufficient
                 ? "Face mesh quality and size are sufficient for biometric verification."
                 : !faceHasEnoughPixels
@@ -1987,27 +2403,28 @@ DETECTION DIRECTIVES:
               ];
               const geminiIndex = geminiByHuman.get(humanIndex);
               const matchedGeminiFace = geminiIndex === undefined ? null : geminiFaces[geminiIndex];
-              // Concealment is an access-policy decision. Resolve it before
-              // consulting the authorized directory so a covered face is
-              // never held up by, or accepted through, biometric matching.
+              const matchedGeminiFaceIsClear = matchedGeminiFace?.isProperlyVisible !== false &&
+                !["OCCLUDED", "BLURRY", "PARTIAL", "NOT_PROPERLY_VISIBLE"].includes(matchedGeminiFace?.visibilityStatus);
+              // An occluded face cannot be identified reliably. Keep it for
+              // manual review instead of converting uncertainty into a breach.
               if (humanFace.occludedByHand) {
                 return {
                   id: matchedGeminiFace?.id || `local-face-${humanIndex}-${ymin}-${xmin}`,
                   box_2d: [ymin, xmin, ymax, xmax],
                   ...(humanFace.embedding ? { embedding: humanFace.embedding } : {}),
-                  status: "UNAUTHORIZED",
+                  status: "UNKNOWN",
                   matchedPersonnelId: null,
-                  matchedName: "UNAUTHORIZED — FACE COVERED",
+                  matchedName: "IDENTITY REVIEW — FACE OCCLUDED",
                   confidence: Math.round(humanFace.confidence * 100),
-                  threatLevel: "HIGH",
-                  threatReason: `Access policy: the nose/mouth identity region is covered in ${currentZone}; the face is classified as unauthorized and biometric matching is blocked.`,
+                  threatLevel: "LOW",
+                  threatReason: `The face is occluded in ${currentZone}; identity cannot be confirmed from this frame and requires manual review.`,
                   isHandOccluded: true,
                   isProperlyVisible: false,
                   visibilityStatus: "OCCLUDED",
-                  visibilityReason: "A detected hand covers the central nose/mouth identity region; access policy classifies this face as unauthorized.",
+                  visibilityReason: "A detected hand covers part of the face; this is insufficient evidence to classify the person as unauthorized.",
                 };
               }
-              const canAttemptBiometricMatch = faceHasEnoughPixels && Boolean(humanFace.embedding);
+              const canAttemptBiometricMatch = identityQualityIsSufficient && matchedGeminiFaceIsClear && Boolean(humanFace.embedding);
               const localMatch = canAttemptBiometricMatch && humanFace.embedding
                 ? RealtimeFaceTracker.matchFaceEmbedding(humanFace.embedding)
                 : null;
@@ -2026,20 +2443,19 @@ DETECTION DIRECTIVES:
                   id: matchedGeminiFace?.id || `local-face-${humanIndex}-${ymin}-${xmin}`,
                   box_2d: [ymin, xmin, ymax, xmax],
                   ...(humanFace.embedding ? { embedding: humanFace.embedding } : {}),
-                  status: matchedGeminiFace?.status === "SUSPICIOUS" ? "SUSPICIOUS" : "AUTHORIZED",
+                  status: "AUTHORIZED",
                   matchedPersonnelId: localPerson.id,
                   matchedName: localPerson.name,
-                  confidence: Math.max(Math.round(humanFace.confidence * 100), Math.round((localMatch?.similarity || 0) * 100)),
-                  threatLevel: matchedGeminiFace?.status === "SUSPICIOUS" ? matchedGeminiFace.threatLevel : "NONE",
-                  threatReason: matchedGeminiFace?.status === "SUSPICIOUS"
-                    ? matchedGeminiFace.threatReason
-                    : `Local biometric match confirmed for ${localPerson.name}.`,
+                  confidence: Math.round((localMatch?.similarity || 0) * 100),
+                  threatLevel: "NONE",
+                  threatReason: `Local biometric match confirmed for ${localPerson.name}; a conflicting vision-model label was ignored.`,
                 };
               }
 
-              const isClearUnmatchedFace = identityQualityIsSufficient && Boolean(humanFace.embedding);
-              const hasAmbiguousDirectoryMatch = Boolean(bestCandidate && bestCandidate.similarity >= nearMatchReviewThreshold);
-              const isUnauthorized = isClearUnmatchedFace && !hasAmbiguousDirectoryMatch;
+              const isClearUnmatchedFace = identityQualityIsSufficient && matchedGeminiFaceIsClear && !hasIncompleteDirectoryBiometrics;
+              const isNearRegisteredPerson = Boolean(bestCandidate && bestCandidate.similarity >= FACE_IDENTITY_REVIEW_THRESHOLD);
+              const needsIdentityReview = isClearUnmatchedFace && isNearRegisteredPerson;
+              const isUnauthorized = isClearUnmatchedFace && !needsIdentityReview;
 
               if (matchedGeminiFace?.status === "SUSPICIOUS") {
                 return {
@@ -2056,17 +2472,27 @@ DETECTION DIRECTIVES:
                 ...(humanFace.embedding ? { embedding: humanFace.embedding } : {}),
                 status: isUnauthorized ? "UNAUTHORIZED" : "UNKNOWN",
                 matchedPersonnelId: null,
-                matchedName: isUnauthorized ? "UNREGISTERED INDIVIDUAL" : "UNVERIFIED SUBJECT",
-                confidence: Math.round(humanFace.confidence * 100),
+                matchedName: needsIdentityReview
+                  ? "POSSIBLE DIRECTORY MATCH"
+                  : isUnauthorized ? "UNREGISTERED INDIVIDUAL" : "UNVERIFIED SUBJECT",
+                confidence: needsIdentityReview
+                  ? Math.round((bestCandidate?.similarity || 0) * 100)
+                  : Math.round(humanFace.confidence * 100),
                 threatLevel: isUnauthorized ? unmatchedThreatLevel : "LOW",
                 threatReason: isUnauthorized
                   ? `Clear face did not match an enrolled person. Unauthorized access is not permitted in ${currentZone}.`
+                  : needsIdentityReview
+                    ? "This clear face is similar to an enrolled profile but did not meet the authorization threshold. Manual verification is required."
                   : identityQualityIsSufficient
                     ? "Face biometric similarity is insufficient for a confident identity decision. Manual review is required."
                     : "Face landmarks or image size are insufficient for safe identity verification; blur or occlusion may be present.",
-                isProperlyVisible: identityQualityIsSufficient,
-                visibilityStatus: identityQualityIsSufficient ? "CLEAR" : "PARTIAL",
-                visibilityReason: identityQualityIsSufficient
+                isProperlyVisible: identityQualityIsSufficient && matchedGeminiFaceIsClear,
+                visibilityStatus: !matchedGeminiFaceIsClear
+                  ? matchedGeminiFace?.visibilityStatus || "NOT_PROPERLY_VISIBLE"
+                  : identityQualityIsSufficient ? "CLEAR" : "PARTIAL",
+                visibilityReason: !matchedGeminiFaceIsClear
+                  ? matchedGeminiFace?.visibilityReason || "Facial identity is not clearly visible; identity remains unverified."
+                  : identityQualityIsSufficient
                   ? "Face mesh quality and size are sufficient for biometric verification."
                   : !faceHasEnoughPixels
                     ? "Face occupies too few pixels for safe biometric verification."
@@ -2092,15 +2518,15 @@ DETECTION DIRECTIVES:
                 const knownPerson = authorizedPersonnel.find((person: any) => person?.id === face.matchedPersonnelId);
                 const validStatuses = ["AUTHORIZED", "UNAUTHORIZED", "UNKNOWN", "SUSPICIOUS"];
                 const modelStatus = validStatuses.includes(face.status) ? face.status : "UNKNOWN";
-                // A vision model's name/status guess is not biometric proof. Only
-                // a local descriptor match to the enrolled directory may verify
-                // an identity; vision-only faces always need another scan/review.
-                const status = tooSmallForBiometrics || modelStatus === "AUTHORIZED"
-                  ? "UNKNOWN"
-                  : modelStatus;
                 const normalizedConfidence = Number.isFinite(face.confidence)
                   ? Math.max(0, Math.min(100, Math.round(face.confidence)))
                   : 55;
+                // A distant/model-only box has no local biometric descriptor,
+                // so it cannot prove either authorization or unauthorized identity.
+                const status = tooSmallForBiometrics || modelStatus === "AUTHORIZED" ||
+                  modelStatus === "UNAUTHORIZED" || Boolean(knownPerson)
+                  ? "UNKNOWN"
+                    : modelStatus;
 
                 return {
                   ...face,
@@ -2109,14 +2535,22 @@ DETECTION DIRECTIVES:
                   status,
                   matchedPersonnelId: status === "AUTHORIZED" ? knownPerson.id : null,
                   matchedName: status === "UNKNOWN"
-                    ? "DISTANT / UNVERIFIED FACE"
-                    : face.matchedName || (status === "AUTHORIZED" ? knownPerson.name : "UNREGISTERED INDIVIDUAL"),
+                    ? modelStatus === "AUTHORIZED" || Boolean(knownPerson)
+                      ? "POSSIBLE DIRECTORY MATCH"
+                      : modelStatus === "UNAUTHORIZED"
+                        ? "UNVERIFIED SUBJECT"
+                      : face.matchedName || (tooSmallForBiometrics ? "DISTANT / UNVERIFIED FACE" : "UNVERIFIED SUBJECT")
+                    : status === "UNAUTHORIZED"
+                      ? "UNREGISTERED INDIVIDUAL"
+                      : face.matchedName || (status === "AUTHORIZED" ? knownPerson?.name : "UNREGISTERED INDIVIDUAL"),
                   confidence: tooSmallForBiometrics ? Math.min(normalizedConfidence, 64) : normalizedConfidence,
-                  threatLevel: status === "UNKNOWN" ? "LOW" : face.threatLevel || "LOW",
+                  threatLevel: status === "UNKNOWN" ? "LOW" : status === "UNAUTHORIZED" ? unmatchedThreatLevel : face.threatLevel || "LOW",
                   threatReason: tooSmallForBiometrics
                     ? `Distant face detected, but its ${Math.round(faceHeight)}px image is too small for reliable biometric verification.`
                     : status === "UNKNOWN" && modelStatus === "AUTHORIZED"
                     ? "The vision model suggested a directory identity, but no local biometric match confirmed it. Manual review is required."
+                    : status === "UNKNOWN" && modelStatus === "UNAUTHORIZED"
+                      ? "The vision model could not confirm this person's identity locally. Manual review is required before an unauthorized decision."
                     : face.threatReason || "Face detected by image analysis; biometric verification is unavailable.",
                   isProperlyVisible: !tooSmallForBiometrics && face.isProperlyVisible !== false,
                   visibilityStatus: tooSmallForBiometrics
@@ -2151,27 +2585,77 @@ DETECTION DIRECTIVES:
         }
       }
 
-      // Identity uncertainty alone must not make every detected face look like
-      // a medium/high security event. Preserve severity for confirmed
-      // unauthorized/suspicious faces and for face-free environmental alerts.
-      if (Array.isArray(parsedData?.detectedFaces)) {
-        const concealmentPattern = /balaclava|ski mask|face.?cover|covered face|conceal(?:ed|ing|ment)?|hiding (?:the )?face/i;
+      // Reconcile every model label against the enrolled biometric directory.
+      // Explicit mask/occlusion or blur signals are unauthorized under the
+      // facility policy; other ambiguous faces still require review.
+      if (Array.isArray(parsedData?.detectedFaces) && feedMode !== "simulation") {
         parsedData.detectedFaces = parsedData.detectedFaces.map((face: any) => {
-          const evidence = [
-            face?.visibilityReason,
-            face?.threatReason,
-            face?.activityContext,
-            ...(Array.isArray(face?.features?.accessories) ? face.features.accessories : []),
-          ].filter((value) => typeof value === "string").join(" ");
-          const faceIsCovered = face?.isHandOccluded === true || face?.visibilityStatus === "OCCLUDED" || concealmentPattern.test(evidence);
-          if (faceIsCovered) {
+          if (!face || typeof face !== "object") return face;
+          const maskOrBlurKind = getFaceMaskOrBlurKind(face);
+          const faceIsCovered = face?.isHandOccluded === true || face?.visibilityStatus === "OCCLUDED";
+          const faceIsUnclear = face?.isProperlyVisible === false ||
+            ["BLURRY", "PARTIAL", "NOT_PROPERLY_VISIBLE"].includes(face?.visibilityStatus);
+          const canCompareBiometrics = Array.isArray(face.embedding) && !faceIsCovered && !faceIsUnclear;
+          const localMatch = canCompareBiometrics ? RealtimeFaceTracker.matchFaceEmbedding(face.embedding) : null;
+          const matchedPerson = localMatch
+            ? authorizedPersonnel.find((person: any) => person?.id === localMatch.personId)
+            : undefined;
+
+          if (maskOrBlurKind) {
+            const reason = maskOrBlurKind === "blur"
+              ? "A blurry face cannot be verified and is unauthorized under the facility access policy."
+              : "A face mask or covering prevents verification and is unauthorized under the facility access policy.";
             return {
               ...face,
               status: "UNAUTHORIZED",
               matchedPersonnelId: null,
-              matchedName: "UNAUTHORIZED — FACE COVERED",
-              threatLevel: "HIGH",
-              threatReason: `Access policy: required facial identity regions are covered in ${currentZone}; covered faces are classified as unauthorized. ${face?.visibilityReason || evidence || "Facial features are occluded."}`,
+              matchedName: "UNAUTHORIZED — MASKED OR BLURRED FACE",
+              threatLevel: unmatchedThreatLevel,
+              threatReason: reason,
+              isProperlyVisible: false,
+              visibilityStatus: maskOrBlurKind === "blur" ? "BLURRY" : "OCCLUDED",
+              visibilityReason: face?.visibilityReason || reason,
+            };
+          }
+
+          if (matchedPerson) {
+            return {
+              ...face,
+              status: "AUTHORIZED",
+              matchedPersonnelId: matchedPerson.id,
+              matchedName: matchedPerson.name,
+              confidence: Math.round(localMatch.similarity * 100),
+              threatLevel: "NONE",
+              threatReason: `Biometric match confirmed for ${matchedPerson.name}; the registered directory match overrides a conflicting model label.`,
+            };
+          }
+
+          const bestCandidate = canCompareBiometrics
+            ? RealtimeFaceTracker.findBestFaceEmbeddingMatch(face.embedding)
+            : null;
+          const cannotConfirmUnmatchedIdentity = faceIsCovered || faceIsUnclear ||
+            hasIncompleteDirectoryBiometrics || !Array.isArray(face.embedding) ||
+            Boolean(bestCandidate && bestCandidate.similarity >= FACE_IDENTITY_REVIEW_THRESHOLD);
+          if (
+            face.status === "AUTHORIZED" ||
+            ((face.status === "UNAUTHORIZED" || face.status === "SUSPICIOUS") && cannotConfirmUnmatchedIdentity)
+          ) {
+            return {
+              ...face,
+              status: "UNKNOWN",
+              matchedPersonnelId: null,
+              matchedName: bestCandidate && bestCandidate.similarity >= FACE_IDENTITY_REVIEW_THRESHOLD
+                ? "POSSIBLE DIRECTORY MATCH"
+                : "UNVERIFIED SUBJECT",
+              threatLevel: "LOW",
+              threatReason: faceIsCovered
+                ? "Facial identity is covered or occluded; manual review is required before an authorization decision."
+                : hasIncompleteDirectoryBiometrics
+                  ? "At least one registered profile has no usable face template; this person cannot safely be marked unauthorized."
+                  : bestCandidate
+                    ? "A registered profile is a possible match, but confidence is insufficient for an automatic decision."
+                    : "The face could not be matched reliably to the directory. Manual review is required.",
+              ...(faceIsCovered ? { isProperlyVisible: false, visibilityStatus: "OCCLUDED" } : {}),
             };
           }
           return face?.status === "UNKNOWN" ? { ...face, threatLevel: "LOW" } : face;

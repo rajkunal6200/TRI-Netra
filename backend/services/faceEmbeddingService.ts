@@ -41,10 +41,13 @@ const INFERENCE_CONFIG = {
       enabled: true,
       modelPath: 'blazeface.json',
       maxDetected: 20,
-      // The library default (0.2) creates broad, low-confidence boxes on
-      // textured background regions. Require a usable face before exposing
-      // it to identity and incident handling.
-      minConfidence: 0.5,
+      // Keep a moderate confidence floor to pick up smaller faces in groups;
+      // identity decisions still use the stricter quality threshold below.
+      minConfidence: 0.4,
+      // BlazeFace defaults to 0.1, which suppresses adjacent people whenever
+      // their face boxes overlap slightly. A higher IoU threshold preserves
+      // nearby faces while still removing near-identical detector boxes.
+      iouThreshold: 0.35,
       skipFrames: 0,
       skipTime: 0,
     },

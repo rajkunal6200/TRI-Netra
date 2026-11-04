@@ -203,8 +203,12 @@ export const IncidentFeed: React.FC<IncidentFeedProps> = ({
         return 'bg-red-50 text-red-700 border-red-200 font-bold';
       case 'ACKNOWLEDGED':
         return 'bg-amber-50 text-amber-800 border-amber-200 font-semibold';
+      case 'DISPATCHED':
+        return 'bg-sky-50 text-sky-800 border-sky-200 font-semibold';
       case 'RESOLVED':
         return 'bg-emerald-50 text-emerald-700 border-emerald-200 font-semibold';
+      case 'FORENSIC_REVIEWED':
+        return 'bg-indigo-50 text-indigo-700 border-indigo-200 font-semibold';
       default:
         return 'bg-zinc-100 text-zinc-700 border-zinc-200 font-medium';
     }
@@ -338,7 +342,7 @@ export const IncidentFeed: React.FC<IncidentFeedProps> = ({
         <div className="flex items-center flex-wrap gap-2">
           {/* Status Filter */}
           <div className="flex items-center bg-zinc-100 rounded-xl p-1 border border-zinc-200">
-            {['ALL', 'ACTIVE', 'ACKNOWLEDGED', 'RESOLVED'].map((st) => (
+            {['ALL', 'ACTIVE', 'ACKNOWLEDGED', 'DISPATCHED', 'RESOLVED', 'FORENSIC_REVIEWED'].map((st) => (
               <button
                 key={st}
                 onClick={() => setFilterStatus(st)}

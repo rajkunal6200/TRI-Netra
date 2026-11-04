@@ -5,6 +5,11 @@ export interface FaceIdentityMatch {
   similarity: number;
 }
 
+export const FACE_IDENTITY_AUTHORIZATION_THRESHOLD = 0.7;
+// Anything close to a registered profile remains a manual review case rather
+// than being treated as an unauthorized person on a single imperfect frame.
+export const FACE_IDENTITY_REVIEW_THRESHOLD = 0.4;
+
 /** Compare two Human FaceRes descriptors on the same scale used for directory matches. */
 export function faceEmbeddingSimilarity(left: FaceEmbedding | null | undefined, right: FaceEmbedding | null | undefined): number | null {
   if (!left || !right || left.length === 0 || left.length !== right.length) return null;
@@ -70,10 +75,9 @@ export function decodeFaceEmbedding(value: unknown): number[] | undefined {
 export class FaceIdentityMatcher {
   private readonly referenceEmbeddings = new Map<string, number[][]>();
 
-  // @vladmandic/human's FaceRes descriptors use its Euclidean-distance
-  // similarity scale, where 0.5 is the documented starting match threshold.
-  // A cosine threshold here was on a different scale and rejected valid staff.
-  constructor(private readonly similarityThreshold: number = 0.5) {
+  // FaceRes similarities use Human's Euclidean-distance scale. Use a stricter
+  // threshold for access decisions to reduce false acceptance of lookalikes.
+  constructor(private readonly similarityThreshold: number = FACE_IDENTITY_AUTHORIZATION_THRESHOLD) {
     if (!Number.isFinite(similarityThreshold) || similarityThreshold < -1 || similarityThreshold > 1) {
       throw new RangeError('Similarity threshold must be between -1 and 1.');
     }
@@ -101,6 +105,10 @@ export class FaceIdentityMatcher {
   public registerAdaptiveEmbedding(personId: string, embedding: FaceEmbedding | null | undefined): boolean {
     if (this.referenceEmbeddings.has(personId)) return true;
     return this.registerEmbedding(personId, embedding);
+  }
+
+  public unregisterEmbedding(personId: string): void {
+    this.referenceEmbeddings.delete(personId);
   }
 
   public match(embedding: FaceEmbedding | null | undefined): FaceIdentityMatch | null {

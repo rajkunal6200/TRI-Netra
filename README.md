@@ -48,6 +48,8 @@ The server listens on port `3000` by default; set `PORT` to change it. The first
 
 Authorized-person location sightings and daily camera transitions are saved in `backend/.local/tracking.json` so history survives server restarts. Keep this file private; set `TRINETRA_TRACKING_FILE` to choose a different storage path.
 
+The authorized personnel directory and enrolled face templates are saved in `backend/.local/personnel.json`. New registrations, directory edits, and removals are synchronized to this file and restored when the server starts. Keep it private; set `TRINETRA_PERSONNEL_FILE` to choose a different storage path.
+
 ## Camera sources
 
 - **Simulation:** Runs the bundled scenarios without a camera or API key.

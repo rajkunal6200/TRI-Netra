@@ -67,9 +67,63 @@ function highestActiveThreat(incidents: SecurityIncident[]): ThreatLevel {
   );
 }
 
-function isAuthorizedPresenceRecord(incident: SecurityIncident): boolean {
-  return incident.faces?.some((face) => face.status === 'AUTHORIZED') === true ||
-    /verified personnel:/i.test(incident.title);
+function isUnauthorizedIncident(incident: SecurityIncident): boolean {
+  return incident.category === 'BIOMETRIC_BREACH' || incident.category === 'IDENTITY_REVIEW' ||
+    incident.faces?.some((face) =>
+      face.status === 'UNAUTHORIZED' || face.status === 'SUSPICIOUS' || face.status === 'UNKNOWN'
+    ) === true;
+}
+
+function getUnauthorizedIncidentMetadata(incident: SecurityIncident): SecurityIncident {
+  return {
+    ...incident,
+    capturedFrameUrl: '',
+    croppedFaceUrl: undefined,
+    fullSceneFrameUrl: undefined,
+    faces: incident.faces.map((face) => ({ ...face, croppedFaceUrl: undefined })),
+    locationHistory: incident.locationHistory?.map(({ capturedFrameUrl: _capturedFrameUrl, ...crumb }) => crumb),
+  };
+}
+
+function isDataImage(value: unknown): value is string {
+  return typeof value === 'string' && /^data:image\/(?:jpeg|png|webp);base64,/i.test(value);
+}
+
+function getIncidentEvidenceUpload(incident: SecurityIncident): boolean {
+  return isDataImage(incident.capturedFrameUrl) || isDataImage(incident.croppedFaceUrl) ||
+    isDataImage(incident.fullSceneFrameUrl) || incident.faces.some((face) => isDataImage(face.croppedFaceUrl));
+}
+
+function mergeStoredIncidents(
+  storedIncidents: SecurityIncident[],
+  currentIncidents: SecurityIncident[]
+): SecurityIncident[] {
+  const byId = new Map(storedIncidents.map((incident) => [incident.id, incident]));
+  for (const localIncident of currentIncidents) {
+    const stored = byId.get(localIncident.id);
+    if (!stored) {
+      byId.set(localIncident.id, localIncident);
+      continue;
+    }
+    const localTime = Date.parse(localIncident.lastSeenTimestamp || localIncident.timestamp);
+    const storedTime = Date.parse(stored.lastSeenTimestamp || stored.timestamp);
+    const preferred = !Number.isFinite(storedTime) || (Number.isFinite(localTime) && localTime >= storedTime)
+      ? localIncident
+      : stored;
+    const other = preferred === localIncident ? stored : localIncident;
+    byId.set(localIncident.id, {
+      ...other,
+      ...preferred,
+      capturedFrameUrl: preferred.capturedFrameUrl || other.capturedFrameUrl,
+      croppedFaceUrl: preferred.croppedFaceUrl || other.croppedFaceUrl,
+      fullSceneFrameUrl: preferred.fullSceneFrameUrl || other.fullSceneFrameUrl,
+      faces: preferred.faces.map((face, index) => ({
+        ...face,
+        croppedFaceUrl: face.croppedFaceUrl || other.faces[index]?.croppedFaceUrl,
+      })),
+    });
+  }
+  return Array.from(byId.values());
 }
 
 const INCIDENT_IDENTITY_MATCH_THRESHOLD = 0.5;
@@ -103,25 +157,6 @@ function getIncidentIdentitySimilarity(faceEmbedding: number[] | undefined, inci
   return similarities.length > 0 ? Math.max(...similarities) : null;
 }
 
-function boxesShareRecentFaceTrack(left: unknown, right: unknown): boolean {
-  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== 4 || right.length !== 4) return false;
-  const a = left.map(Number);
-  const b = right.map(Number);
-  if (![...a, ...b].every(Number.isFinite)) return false;
-  const [aTop, aLeft, aBottom, aRight] = a;
-  const [bTop, bLeft, bBottom, bRight] = b;
-  const aWidth = Math.max(0, aRight - aLeft);
-  const aHeight = Math.max(0, aBottom - aTop);
-  const bWidth = Math.max(0, bRight - bLeft);
-  const bHeight = Math.max(0, bBottom - bTop);
-  const smallerArea = Math.min(aWidth * aHeight, bWidth * bHeight);
-  if (smallerArea <= 0) return false;
-  const intersection = Math.max(0, Math.min(aRight, bRight) - Math.max(aLeft, bLeft)) *
-    Math.max(0, Math.min(aBottom, bBottom) - Math.max(aTop, bTop));
-  const centerDistance = Math.hypot((aLeft + aRight - bLeft - bRight) / 2, (aTop + aBottom - bTop - bBottom) / 2);
-  return intersection / smallerArea >= 0.4 && centerDistance <= Math.max(45, Math.min(aWidth, bWidth) * 0.65);
-}
-
 function rememberIncidentIdentityEmbedding(
   incident: SecurityIncident,
   candidate: number[] | undefined
@@ -140,91 +175,6 @@ function rememberIncidentIdentityEmbedding(
     ...(identityEmbedding ? { identityEmbedding } : {}),
     ...(identityEmbeddings.length > 0 ? { identityEmbeddings } : {}),
   };
-}
-
-function collapseDuplicateFaceIncidents(incidents: SecurityIncident[]): SecurityIncident[] {
-  const unique: SecurityIncident[] = [];
-
-  for (const incident of incidents) {
-    const face = incident.faces?.[0];
-    if (!face || face.status === 'AUTHORIZED' || incident.category === 'CAMERA_OFFLINE') {
-      unique.push(incident);
-      continue;
-    }
-
-    const duplicateIndex = unique.findIndex((candidate) => {
-      const candidateFace = candidate.faces?.[0];
-      if (
-        !candidateFace || candidateFace.status === 'AUTHORIZED' || candidate.category === 'CAMERA_OFFLINE' ||
-        ((candidate.feedMode === 'simulation') !== (incident.feedMode === 'simulation'))
-      ) return false;
-      if (
-        candidate.channelId === incident.channelId && candidate.timestamp === incident.timestamp &&
-        candidate.subjectIndex !== incident.subjectIndex
-      ) return false;
-      const similarity = getIncidentIdentityEmbeddings(candidate).flatMap((left) =>
-        getIncidentIdentityEmbeddings(incident).map((right) => faceEmbeddingSimilarity(left, right))
-      ).filter((value): value is number => value !== null);
-      return similarity.some((value) => value >= INCIDENT_IDENTITY_MATCH_THRESHOLD);
-    });
-
-    if (duplicateIndex === -1) {
-      unique.push(incident);
-      continue;
-    }
-
-    const latest = unique[duplicateIndex];
-    let merged = latest;
-    for (const embedding of getIncidentIdentityEmbeddings(incident)) {
-      merged = { ...merged, ...rememberIncidentIdentityEmbedding(merged, embedding) };
-    }
-
-    const toBreadcrumb = (entry: SecurityIncident): LocationBreadcrumb[] => entry.locationHistory?.length
-      ? entry.locationHistory
-      : [{
-          zone: entry.zone,
-          channelId: entry.channelId,
-          channelName: entry.channelName,
-          channelNumber: entry.channelNumber,
-          timestamp: entry.lastSeenTimestamp || entry.timestamp,
-          firstSeenTimestamp: entry.firstSeenTimestamp || entry.timestamp,
-          sightingsCount: entry.sightingsCount || 1,
-        }];
-    const mergedLocations = new Map<string, LocationBreadcrumb>();
-    for (const breadcrumb of [...toBreadcrumb(latest), ...toBreadcrumb(incident)]) {
-      const locationKey = `${breadcrumb.zone}|${breadcrumb.channelId || breadcrumb.channelNumber || breadcrumb.channelName || ''}`;
-      const prior = mergedLocations.get(locationKey);
-      if (!prior) {
-        mergedLocations.set(locationKey, { ...breadcrumb, capturedFrameUrl: undefined });
-        continue;
-      }
-      const priorTime = Date.parse(prior.timestamp);
-      const nextTime = Date.parse(breadcrumb.timestamp);
-      const priorFirst = Date.parse(prior.firstSeenTimestamp || prior.timestamp);
-      const nextFirst = Date.parse(breadcrumb.firstSeenTimestamp || breadcrumb.timestamp);
-      mergedLocations.set(locationKey, {
-        ...prior,
-        timestamp: nextTime > priorTime ? breadcrumb.timestamp : prior.timestamp,
-        firstSeenTimestamp: nextFirst < priorFirst ? breadcrumb.firstSeenTimestamp || breadcrumb.timestamp : prior.firstSeenTimestamp || prior.timestamp,
-        sightingsCount: (prior.sightingsCount || 1) + (breadcrumb.sightingsCount || 1),
-        capturedFrameUrl: undefined,
-      });
-    }
-
-    const latestTime = Date.parse(latest.lastSeenTimestamp || latest.timestamp);
-    const incidentTime = Date.parse(incident.lastSeenTimestamp || incident.timestamp);
-    const latestFirst = Date.parse(latest.firstSeenTimestamp || latest.timestamp);
-    const incidentFirst = Date.parse(incident.firstSeenTimestamp || incident.timestamp);
-    unique[duplicateIndex] = {
-      ...merged,
-      sightingsCount: (latest.sightingsCount || 1) + (incident.sightingsCount || 1),
-      firstSeenTimestamp: incidentFirst < latestFirst ? incident.firstSeenTimestamp || incident.timestamp : latest.firstSeenTimestamp || latest.timestamp,
-      lastSeenTimestamp: incidentTime > latestTime ? incident.lastSeenTimestamp || incident.timestamp : latest.lastSeenTimestamp || latest.timestamp,
-      locationHistory: [...mergedLocations.values()],
-    };
-  }
-
-  return unique;
 }
 
 export default function App() {
@@ -287,7 +237,9 @@ export default function App() {
     }
     return DEFAULT_PERSONNEL;
   });
+  const [isPersonnelStoreReady, setIsPersonnelStoreReady] = useState<boolean>(false);
   const [isIdentityDirectoryReady, setIsIdentityDirectoryReady] = useState<boolean>(false);
+  const personnelSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   // Security Incidents with guaranteed unique IDs and strict 1-incident-per-person isolation
   const [incidents, setIncidents] = useState<SecurityIncident[]>(() => {
@@ -318,7 +270,7 @@ export default function App() {
                 ? rawItem.locationHistory.filter((crumb: any) => crumb && typeof crumb === 'object' && typeof crumb.timestamp === 'string')
                 : [],
             };
-            if (!['ACTIVE', 'ACKNOWLEDGED', 'RESOLVED', 'DISMISSED'].includes(item.status)) continue;
+            if (!['ACTIVE', 'ACKNOWLEDGED', 'DISPATCHED', 'RESOLVED', 'DISMISSED', 'FORENSIC_REVIEWED'].includes(item.status)) continue;
             if (!['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(item.threatLevel)) continue;
 
             // If an older incident bundled multiple faces together, split them into separate individual logs
@@ -327,6 +279,13 @@ export default function App() {
                 const subNum = fIdx + 1;
                 restoredIncidents.push({
                   ...item,
+                  category: f.status === 'UNAUTHORIZED'
+                    ? 'BIOMETRIC_BREACH'
+                    : item.category === 'BIOMETRIC_BREACH' && f.status !== 'SUSPICIOUS' && f.status !== 'UNKNOWN'
+                    ? 'BIOMETRIC_BREACH'
+                    : item.category === 'IDENTITY_REVIEW' || f.status === 'SUSPICIOUS' || f.status === 'UNKNOWN'
+                    ? 'IDENTITY_REVIEW'
+                    : item.category,
                   threatLevel: item.category === 'IDENTITY_REVIEW' || f.status === 'UNKNOWN' ? 'LOW' : item.threatLevel,
                   id: `${item.id}-P${subNum}`,
                   subjectIndex: subNum,
@@ -344,6 +303,13 @@ export default function App() {
             // a long history into fake people when restoring from local storage.
             restoredIncidents.push({
               ...item,
+              category: item.faces[0]?.status === 'UNAUTHORIZED'
+                ? 'BIOMETRIC_BREACH'
+                : item.category === 'BIOMETRIC_BREACH' && item.faces[0]?.status !== 'SUSPICIOUS' && item.faces[0]?.status !== 'UNKNOWN'
+                ? 'BIOMETRIC_BREACH'
+                : item.category === 'IDENTITY_REVIEW' || item.faces[0]?.status === 'SUSPICIOUS' || item.faces[0]?.status === 'UNKNOWN'
+                ? 'IDENTITY_REVIEW'
+                : item.category,
               threatLevel: item.category === 'IDENTITY_REVIEW' || item.faces[0]?.status === 'UNKNOWN'
                 ? 'LOW'
                 : item.threatLevel,
@@ -353,9 +319,7 @@ export default function App() {
               faces: item.faces.slice(0, 1),
             });
           }
-          return collapseDuplicateFaceIncidents(
-            restoredIncidents.filter((incident) => !isAuthorizedPresenceRecord(incident))
-          );
+          return restoredIncidents;
         }
       } catch (e) {
         console.warn('Failed to parse saved incidents:', e);
@@ -364,15 +328,12 @@ export default function App() {
     return [];
   });
   const [incidentEvidenceReady, setIncidentEvidenceReady] = useState(false);
-
-  // Also clean up duplicate biometric rows already held in the running UI state
-  // (for example, when this code updates through hot reload without a full restart).
-  useEffect(() => {
-    setIncidents((previous) => {
-      const collapsed = collapseDuplicateFaceIncidents(previous);
-      return collapsed.length === previous.length ? previous : collapsed;
-    });
-  }, []);
+  const [isUnauthorizedIncidentStoreReady, setIsUnauthorizedIncidentStoreReady] = useState(false);
+  const unauthorizedIncidentSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const unauthorizedIncidentSnapshotRef = useRef<Map<string, string>>(new Map());
+  const unauthorizedIncidentEvidenceSavedAtRef = useRef<Map<string, number>>(new Map());
+  const pendingUnauthorizedIncidentDeletesRef = useRef<Set<string>>(new Set());
+  const pendingUnauthorizedIncidentClearRef = useRef(false);
 
   // Settings
   const [settings, setSettings] = useState<SurveillanceSettings>(() => {
@@ -538,7 +499,7 @@ export default function App() {
   const [totalScansCount, setTotalScansCount] = useState<number>(0);
   const [authorizedMatchesCount, setAuthorizedMatchesCount] = useState<number>(0);
   const [unauthorizedBreachesCount, setUnauthorizedBreachesCount] = useState<number>(0);
-  const incidentLog = incidents.filter((incident) => !isAuthorizedPresenceRecord(incident));
+  const incidentLog = incidents;
   const activeIncidents = incidentLog.filter((inc) => inc.status === 'ACTIVE');
   const operationalIncidents = activeIncidents.filter((inc) =>
     inc.feedMode !== 'simulation' &&
@@ -580,78 +541,216 @@ export default function App() {
     setIncidentNotification(null);
   };
 
+  useEffect(() => {
+    let isMounted = true;
+    void fetch('/api/personnel')
+      .then((response) => {
+        if (!response.ok) throw new Error(`Personnel database load failed (${response.status}).`);
+        return response.json();
+      })
+      .then((result: { personnel?: AuthorizedPerson[] }) => {
+        if (!isMounted) return;
+        const serverPersonnel = Array.isArray(result.personnel)
+          ? result.personnel.filter((person) => person && typeof person.id === 'string' && typeof person.name === 'string')
+          : [];
+        if (serverPersonnel.length > 0) {
+          setAuthorizedPersonnel(serverPersonnel.map((person) => {
+            const faceEmbeddings = Array.isArray(person.faceEmbeddings)
+              ? person.faceEmbeddings.map(decodeFaceEmbedding).filter((embedding): embedding is number[] => Boolean(embedding)).slice(0, 5)
+              : [];
+            const faceEmbedding = decodeFaceEmbedding(person.faceEmbedding) || faceEmbeddings[0];
+            return {
+              ...person,
+              photoUrl: typeof person.photoUrl === 'string' ? person.photoUrl : '',
+              accessZones: Array.isArray(person.accessZones) ? person.accessZones : [],
+              faceEmbedding,
+              faceEmbeddings: faceEmbeddings.length > 0 ? faceEmbeddings : faceEmbedding ? [faceEmbedding] : undefined,
+            };
+          }));
+        }
+        setIsPersonnelStoreReady(true);
+      })
+      .catch((error: unknown) => {
+        console.warn('Could not load the server personnel database; using this device\'s saved directory:', error);
+        if (isMounted) setIsPersonnelStoreReady(true);
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   // Sync state safely to local storage
   useEffect(() => {
+    if (!isPersonnelStoreReady) return;
     safeSetItem('trinetra_personnel', JSON.stringify(authorizedPersonnel.map((person) => ({
       ...person,
       faceEmbedding: encodeFaceEmbeddingForStorage(person.faceEmbedding),
       faceEmbeddings: person.faceEmbeddings?.map(encodeFaceEmbeddingForStorage).filter((embedding): embedding is string => Boolean(embedding)),
     }))));
-  }, [authorizedPersonnel]);
+  }, [authorizedPersonnel, isPersonnelStoreReady]);
 
   useEffect(() => {
-    const profilesToSync = authorizedPersonnel.filter((person) => person.faceEmbeddings?.length || person.faceEmbedding || person.photoUrl);
-    for (const person of profilesToSync) {
-      const embeddings = person.faceEmbeddings?.length
-        ? person.faceEmbeddings
-        : person.faceEmbedding ? [person.faceEmbedding] : [];
-      if (embeddings.length === 0) continue;
-      RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings);
+    if (!isPersonnelStoreReady) {
+      setIsIdentityDirectoryReady(false);
+      return;
     }
-
     let isMounted = true;
-    setIsIdentityDirectoryReady(profilesToSync.length === 0);
-    if (profilesToSync.length > 0) {
-      void fetch('/api/tracking/register-embeddings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          personnel: profilesToSync.map(({ id, faceEmbedding, faceEmbeddings, photoUrl }) => {
-            const profileEmbeddings = faceEmbeddings?.length ? faceEmbeddings : faceEmbedding ? [faceEmbedding] : [];
-            return {
-              id,
-              ...(profileEmbeddings.length > 1
-                ? { faceEmbeddings: profileEmbeddings }
-                : profileEmbeddings[0] ? { faceEmbedding: profileEmbeddings[0] } : {}),
-              ...(profileEmbeddings.length === 0 && photoUrl ? { photoUrl } : {}),
-            };
-          }),
-        }),
-      }).then((response) => {
-        if (!response.ok) throw new Error(`Identity sync failed (${response.status}).`);
-        return response.json();
-      }).then((result: { embeddings?: { personId: string; faceEmbedding?: number[]; faceEmbeddings?: number[][] }[] }) => {
-        if (isMounted && Array.isArray(result.embeddings) && result.embeddings.length > 0) {
-          const embeddingsByPerson = new Map(result.embeddings.map((entry) => [
-            entry.personId,
-            entry.faceEmbeddings?.length ? entry.faceEmbeddings : entry.faceEmbedding ? [entry.faceEmbedding] : [],
-          ]));
-          setAuthorizedPersonnel((previous) => {
-            let changed = false;
-            const updated = previous.map((person) => {
-              const faceEmbeddings = embeddingsByPerson.get(person.id);
-              if (!faceEmbeddings?.length || person.faceEmbeddings?.length || person.faceEmbedding) return person;
-              changed = true;
-              RealtimeFaceTracker.registerFaceEmbeddings(person.id, faceEmbeddings);
-              return { ...person, faceEmbedding: faceEmbeddings[0], faceEmbeddings };
-            });
-            return changed ? updated : previous;
+    setIsIdentityDirectoryReady(false);
+    personnelSaveQueueRef.current = personnelSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const saveResponse = await fetch('/api/personnel', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ personnel: authorizedPersonnel }),
+        });
+        if (!saveResponse.ok) throw new Error(`Personnel database save failed (${saveResponse.status}).`);
+
+        const profilesToSync = authorizedPersonnel.filter((person) => person.faceEmbeddings?.length || person.faceEmbedding || person.photoUrl);
+        for (const person of profilesToSync) {
+          const embeddings = person.faceEmbeddings?.length
+            ? person.faceEmbeddings
+            : person.faceEmbedding ? [person.faceEmbedding] : [];
+          if (embeddings.length > 0) RealtimeFaceTracker.registerFaceEmbeddings(person.id, embeddings);
+        }
+
+        if (profilesToSync.length > 0) {
+          const response = await fetch('/api/tracking/register-embeddings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              personnel: profilesToSync.map(({ id, faceEmbedding, faceEmbeddings, photoUrl }) => {
+                const profileEmbeddings = faceEmbeddings?.length ? faceEmbeddings : faceEmbedding ? [faceEmbedding] : [];
+                return {
+                  id,
+                  ...(profileEmbeddings.length > 1
+                    ? { faceEmbeddings: profileEmbeddings }
+                    : profileEmbeddings[0] ? { faceEmbedding: profileEmbeddings[0] } : {}),
+                  ...(profileEmbeddings.length === 0 && photoUrl ? { photoUrl } : {}),
+                };
+              }),
+            }),
           });
+          if (!response.ok) throw new Error(`Identity sync failed (${response.status}).`);
+          const result: { embeddings?: { personId: string; faceEmbedding?: number[]; faceEmbeddings?: number[][] }[] } = await response.json();
+          if (isMounted && Array.isArray(result.embeddings) && result.embeddings.length > 0) {
+            const embeddingsByPerson = new Map(result.embeddings.map((entry) => [
+              entry.personId,
+              entry.faceEmbeddings?.length ? entry.faceEmbeddings : entry.faceEmbedding ? [entry.faceEmbedding] : [],
+            ]));
+            setAuthorizedPersonnel((previous) => {
+              let changed = false;
+              const updated = previous.map((person) => {
+                const faceEmbeddings = embeddingsByPerson.get(person.id);
+                if (!faceEmbeddings?.length || person.faceEmbeddings?.length || person.faceEmbedding) return person;
+                changed = true;
+                RealtimeFaceTracker.registerFaceEmbeddings(person.id, faceEmbeddings);
+                return { ...person, faceEmbedding: faceEmbeddings[0], faceEmbeddings };
+              });
+              return changed ? updated : previous;
+            });
+          }
         }
         if (isMounted) setIsIdentityDirectoryReady(true);
-      }).catch((error: unknown) => {
+      })
+      .catch((error: unknown) => {
         if (isMounted) setIsIdentityDirectoryReady(false);
-        console.warn('Could not sync the authorized face directory:', error);
+        console.warn('Could not save or sync the authorized face directory:', error);
       });
-    }
     return () => {
       isMounted = false;
     };
-  }, [authorizedPersonnel]);
+  }, [authorizedPersonnel, isPersonnelStoreReady]);
 
   useEffect(() => {
     safeSetItem('trinetra_incidents', sanitizeIncidentsForStorage(incidentLog));
   }, [incidents]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let retryTimer: number | undefined;
+    const loadUnauthorizedIncidentStore = async () => {
+      try {
+        const response = await fetch('/api/incidents/unauthorized');
+        if (!response.ok) throw new Error(`Unauthorized incident database load failed (${response.status}).`);
+        const result: { incidents?: SecurityIncident[] } = await response.json();
+        if (!isMounted) return;
+        const storedIncidents = pendingUnauthorizedIncidentClearRef.current
+          ? []
+          : Array.isArray(result.incidents)
+            ? result.incidents.filter((incident) => incident && typeof incident.id === 'string' &&
+                isUnauthorizedIncident(incident) && !pendingUnauthorizedIncidentDeletesRef.current.has(incident.id))
+            : [];
+        pendingUnauthorizedIncidentClearRef.current = false;
+        unauthorizedIncidentSnapshotRef.current = new Map(storedIncidents.map((incident) => [
+          incident.id,
+          JSON.stringify(getUnauthorizedIncidentMetadata(incident)),
+        ]));
+        unauthorizedIncidentEvidenceSavedAtRef.current = new Map(storedIncidents.map((incident) => [
+          incident.id,
+          incident.capturedFrameUrl ? Date.now() : 0,
+        ]));
+        setIncidents((previous) => mergeStoredIncidents(storedIncidents, previous));
+        setIsUnauthorizedIncidentStoreReady(true);
+      } catch (error) {
+        console.warn('Could not load the unauthorized incident database; retrying:', error);
+        if (isMounted) retryTimer = window.setTimeout(loadUnauthorizedIncidentStore, 5_000);
+      }
+    };
+    void loadUnauthorizedIncidentStore();
+    return () => {
+      isMounted = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isUnauthorizedIncidentStoreReady) return;
+    const timer = window.setTimeout(() => {
+      const now = Date.now();
+      const changedIncidents = incidents
+        .filter(isUnauthorizedIncident)
+        .map((incident) => {
+          const metadata = JSON.stringify(getUnauthorizedIncidentMetadata(incident));
+          const lastEvidenceSavedAt = unauthorizedIncidentEvidenceSavedAtRef.current.get(incident.id) || 0;
+          const includeEvidence = getIncidentEvidenceUpload(incident) && now - lastEvidenceSavedAt >= 10_000;
+          return { incident, metadata, includeEvidence };
+        })
+        .filter(({ incident, metadata, includeEvidence }) =>
+          unauthorizedIncidentSnapshotRef.current.get(incident.id) !== metadata || includeEvidence
+        );
+
+      if (changedIncidents.length === 0) return;
+      unauthorizedIncidentSaveQueueRef.current = unauthorizedIncidentSaveQueueRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          for (const { incident, metadata, includeEvidence } of changedIncidents) {
+            const payload: SecurityIncident = { ...incident };
+            if (!includeEvidence) {
+              if (isDataImage(payload.capturedFrameUrl)) payload.capturedFrameUrl = '';
+              if (isDataImage(payload.croppedFaceUrl)) payload.croppedFaceUrl = undefined;
+              if (isDataImage(payload.fullSceneFrameUrl)) payload.fullSceneFrameUrl = undefined;
+              payload.faces = payload.faces.map((face) => ({
+                ...face,
+                croppedFaceUrl: isDataImage(face.croppedFaceUrl) ? undefined : face.croppedFaceUrl,
+              }));
+            }
+            const response = await fetch('/api/incidents/unauthorized', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ incident: payload }),
+            });
+            if (!response.ok) throw new Error(`Unauthorized incident save failed (${response.status}).`);
+            unauthorizedIncidentSnapshotRef.current.set(incident.id, metadata);
+            if (includeEvidence) unauthorizedIncidentEvidenceSavedAtRef.current.set(incident.id, Date.now());
+          }
+        })
+        .catch((error: unknown) => {
+          console.warn('Could not save an unauthorized incident:', error);
+        });
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [incidents, isUnauthorizedIncidentStoreReady]);
 
   useEffect(() => {
     let isMounted = true;
@@ -688,27 +787,17 @@ export default function App() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [isUnauthorizedIncidentStoreReady]);
 
   useEffect(() => {
     if (!incidentEvidenceReady) return;
     const timer = window.setTimeout(() => {
-      const securityIncidents = incidents.filter((incident) => !isAuthorizedPresenceRecord(incident));
-      void syncIncidentEvidence(securityIncidents).catch((error: unknown) => {
+      void syncIncidentEvidence(incidents).catch((error: unknown) => {
         console.warn('Could not save incident photos:', error);
       });
     }, 700);
     return () => window.clearTimeout(timer);
   }, [incidentEvidenceReady, incidents]);
-
-  useEffect(() => {
-    if (incidents.some(isAuthorizedPresenceRecord)) {
-      setIncidents((previous) => {
-        const cleaned = previous.filter((incident) => !isAuthorizedPresenceRecord(incident));
-        return cleaned.length === previous.length ? previous : cleaned;
-      });
-    }
-  }, [incidents]);
 
   useEffect(() => {
     safeSetItem('trinetra_settings', JSON.stringify(settings));
@@ -827,46 +916,10 @@ export default function App() {
       const facesWithPortraits = await attachIsolatedPortraitsToFaces(frameBase64, result.faces);
 
       const unauthFaces = facesWithPortraits.filter(
-        (f) => f.status === 'UNAUTHORIZED' || f.status === 'SUSPICIOUS'
+        (f) => f.status === 'UNAUTHORIZED'
       );
-      const reviewFaces = facesWithPortraits.filter((f) => f.status === 'UNKNOWN');
+      const reviewFaces = facesWithPortraits.filter((f) => f.status === 'UNKNOWN' || f.status === 'SUSPICIOUS');
       const authFaces = facesWithPortraits.filter((f) => f.status === 'AUTHORIZED');
-
-      // A face can be ambiguous in one frame and biometrically confirmed in a
-      // later frame. Once confirmed, remove its stale review row so it no
-      // longer appears beside the person's verified location history.
-      const confirmedAuthorizedFaces = authFaces.filter((face) =>
-        Boolean(face.matchedPersonnelId && face.embedding)
-      );
-      if (confirmedAuthorizedFaces.length > 0 && result.feedMode !== 'simulation') {
-        setIncidents((previous) => {
-          let removedReview = false;
-          const next = previous.filter((incident) => {
-            if (incident.category !== 'IDENTITY_REVIEW') return true;
-            // Two different faces in the same frame must remain separate.
-            if (incident.channelId === result.channelId && incident.timestamp === result.timestamp) return true;
-            const identityRefs = getIncidentIdentityEmbeddings(incident);
-            const incidentFace = incident.faces?.[0];
-            const incidentLastSeen = Date.parse(incident.lastSeenTimestamp || incident.timestamp);
-            const resultTime = Date.parse(result.timestamp);
-            const isRecentSameCameraTrack = incident.channelId === result.channelId &&
-              Number.isFinite(incidentLastSeen) && Number.isFinite(resultTime) &&
-              Math.abs(resultTime - incidentLastSeen) <= 12_000;
-            const confirmedSameFace = confirmedAuthorizedFaces.some((face) => {
-              const exactBiometricMatch = identityRefs.some((reference) =>
-                (faceEmbeddingSimilarity(face.embedding, reference) ?? 0) >= INCIDENT_IDENTITY_MATCH_THRESHOLD
-              );
-              const continuousCameraTrackMatch = isRecentSameCameraTrack &&
-                boxesShareRecentFaceTrack(face.box_2d, incidentFace?.box_2d) &&
-                identityRefs.some((reference) => (faceEmbeddingSimilarity(face.embedding, reference) ?? 0) >= 0.4);
-              return exactBiometricMatch || continuousCameraTrackMatch;
-            });
-            if (confirmedSameFace) removedReview = true;
-            return !confirmedSameFace;
-          });
-          return removedReview ? next : previous;
-        });
-      }
 
       const hasFaceFreeCriticalThreat = facesWithPortraits.length === 0 &&
         (result.overallThreatLevel === 'HIGH' || result.overallThreatLevel === 'CRITICAL');
@@ -974,7 +1027,7 @@ export default function App() {
             // Unique faceKey fallback for cameras that do not provide a descriptor.
             const boxCenterX = Math.round(((face.box_2d?.[1] ?? 0) + (face.box_2d?.[3] ?? 0)) / 2);
             const boxCenterY = Math.round(((face.box_2d?.[0] ?? 0) + (face.box_2d?.[2] ?? 0)) / 2);
-            const isIdentityReview = face.status === 'UNKNOWN';
+            const isIdentityReview = face.status === 'UNKNOWN' || face.status === 'SUSPICIOUS';
             const incidentThreatLevel = isIdentityReview
               ? 'LOW'
               : face.threatLevel || (face.status === 'AUTHORIZED' ? 'LOW' : result.overallThreatLevel);
@@ -1039,6 +1092,9 @@ export default function App() {
 
             if (matchIndex !== -1) {
               const existing = currentIncidents[matchIndex];
+              const wasPreviouslyUnauthorized = existing.category === 'BIOMETRIC_BREACH' || existing.faces.some((priorFace) =>
+                priorFace.status === 'UNAUTHORIZED'
+              );
               const newCount = (existing.sightingsCount || 1) + 1;
               
               // Track breadcrumb trail across all camera locations
@@ -1141,17 +1197,31 @@ export default function App() {
                 feedMode: result.feedMode,
                 threatLevel: incidentThreatLevel,
                 ...rememberIncidentIdentityEmbedding(existing, face.embedding),
-                category: isIdentityReview
+                category: wasPreviouslyUnauthorized
+                  ? 'BIOMETRIC_BREACH'
+                  : isIdentityReview
                   ? 'IDENTITY_REVIEW'
-                  : face.status === 'AUTHORIZED' ? undefined : 'BIOMETRIC_BREACH',
-                description: isIdentityReview
+                  : face.status === 'AUTHORIZED'
+                  ? undefined
+                  : 'BIOMETRIC_BREACH',
+                description: wasPreviouslyUnauthorized && face.status === 'AUTHORIZED'
+                  ? `This person was previously recorded as unauthorized. A later scan matched ${subjectLabel} in the authorized directory. The original incident is retained for operator review.`
+                  : wasPreviouslyUnauthorized && isIdentityReview
+                  ? `This person was previously recorded as unauthorized. The latest face image is unclear, so the original incident remains open for operator review.`
+                  : isIdentityReview
                   ? `${isMultiLocation ? `This face has appeared at ${uniqueLocations.join(' ➔ ')}. ` : ''}No authorized profile matched with sufficient confidence. Manual identity review is required; unauthorized status is not confirmed.`
                   : face.status === 'AUTHORIZED'
                   ? `Biometric match confirmed: ${subjectLabel}.${isMultiLocation ? ` Seen at ${uniqueLocations.join(' ➔ ')}.` : ''}`
                   : isMultiLocation
                   ? `Person tracked across ${uniqueLocations.length} camera locations: ${uniqueLocations.join(' ➔ ')}. Currently sighted in ${zoneLabel} on ${camLabel}.`
                   : face.threatReason || result.sceneSummary || `Unregistered individual detected on ${camLabel} in ${zoneLabel}: Face biometric not present in authorized personnel directory.`,
-                title: isIdentityReview
+                title: wasPreviouslyUnauthorized
+                  ? face.status === 'AUTHORIZED'
+                    ? `⚠️ Prior Unauthorized Detection · Matched: ${subjectLabel}`
+                    : isIdentityReview
+                    ? `⚠️ Prior Unauthorized Detection · Review Required`
+                    : `⚠️ Unauthorized Person on ${camLabel}`
+                  : isIdentityReview
                   ? `🔎 Identity Review: ${subjectLabel} on ${camLabel}`
                   : face.status === 'AUTHORIZED'
                   ? `🛡️ Verified Personnel: ${subjectLabel} on ${camLabel}`
@@ -1160,7 +1230,9 @@ export default function App() {
                   : totalSubjects > 1
                   ? `⚠️ ${subjectLabel} on ${camLabel} (Seen ${newCount}x)`
                   : `⚠️ Unregistered Face on ${camLabel} (Seen ${newCount}x)`,
-                status: face.status === 'AUTHORIZED' ? 'RESOLVED' : 'ACTIVE',
+                status: wasPreviouslyUnauthorized
+                  ? existing.status
+                  : face.status === 'AUTHORIZED' ? 'RESOLVED' : 'ACTIVE',
                 faces: [incidentFace],
               };
 
@@ -1232,7 +1304,7 @@ export default function App() {
             currentIncidents.unshift(newIncident);
           }
 
-          return currentIncidents.slice(0, 99);
+          return currentIncidents;
         });
       }
     },
@@ -1262,7 +1334,23 @@ export default function App() {
   };
 
   const handleDeleteIncident = (id: string) => {
+    const deletedIncident = incidents.find((incident) => incident.id === id);
     setIncidents((prev) => prev.filter((inc) => inc.id !== id));
+    if (deletedIncident && isUnauthorizedIncident(deletedIncident)) {
+      pendingUnauthorizedIncidentDeletesRef.current.add(id);
+      unauthorizedIncidentSaveQueueRef.current = unauthorizedIncidentSaveQueueRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          const response = await fetch(`/api/incidents/unauthorized/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          if (!response.ok) throw new Error(`Unauthorized incident delete failed (${response.status}).`);
+          unauthorizedIncidentSnapshotRef.current.delete(id);
+          unauthorizedIncidentEvidenceSavedAtRef.current.delete(id);
+        })
+        .catch((error: unknown) => {
+          pendingUnauthorizedIncidentDeletesRef.current.delete(id);
+          console.warn('Could not delete the saved unauthorized incident:', error);
+        });
+    }
   };
 
   // Handle Camera Feed Toggle (Close camera / re-open camera in any zone)
@@ -1296,7 +1384,7 @@ export default function App() {
         if (previous.some((incident) => incident.category === 'CAMERA_OFFLINE' && incident.channelId === camera.id && incident.status === 'ACTIVE')) {
           return previous;
         }
-        return [offlineIncident, ...previous].slice(0, 99);
+        return [offlineIncident, ...previous];
       });
       soundEngine.playWarningBeep();
       soundEngine.speakAnnouncement(`Camera feed closed in ${zoneName}.`, true);
@@ -1317,6 +1405,19 @@ export default function App() {
 
   const handleClearAllIncidents = () => {
     setIncidents([]);
+    pendingUnauthorizedIncidentClearRef.current = true;
+    unauthorizedIncidentSaveQueueRef.current = unauthorizedIncidentSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await fetch('/api/incidents/unauthorized', { method: 'DELETE' });
+        if (!response.ok) throw new Error(`Unauthorized incident database clear failed (${response.status}).`);
+        unauthorizedIncidentSnapshotRef.current.clear();
+        unauthorizedIncidentEvidenceSavedAtRef.current.clear();
+        if (isUnauthorizedIncidentStoreReady) pendingUnauthorizedIncidentClearRef.current = false;
+      })
+      .catch((error: unknown) => {
+        console.warn('Could not clear the saved unauthorized incidents:', error);
+      });
   };
 
   const handleDispatchSecurity = (id: string) => {
@@ -1326,12 +1427,23 @@ export default function App() {
         inc.id === id
           ? {
               ...inc,
-              status: 'ACKNOWLEDGED',
+              status: 'DISPATCHED',
               operatorNotes: `[${new Date().toLocaleTimeString()}] Dispatch request logged for sector ${inc.zone}. No external dispatch integration is configured.`,
             }
           : inc
       )
     );
+  };
+
+  const handleForensicReviewComplete = (id: string) => {
+    setIncidents((previous) => previous.map((incident) => incident.id === id
+      ? {
+          ...incident,
+          status: 'FORENSIC_REVIEWED',
+          operatorNotes: `${incident.operatorNotes ? `${incident.operatorNotes}\n` : ''}[${new Date().toLocaleString()}] Forensic review completed.`,
+        }
+      : incident
+    ));
   };
 
   const updateSettingsPartial = (newSet: Partial<SurveillanceSettings>) => {
@@ -1494,6 +1606,7 @@ export default function App() {
         onAcknowledge={handleAcknowledgeIncident}
         onResolve={handleResolveIncident}
         onDispatchTeam={handleDispatchSecurity}
+        onForensicReview={handleForensicReviewComplete}
       />
 
       <SettingsModal

@@ -24,6 +24,7 @@ interface IncidentDetailsModalProps {
   onAcknowledge: (id: string) => void;
   onResolve: (id: string) => void;
   onDispatchTeam: (id: string) => void;
+  onForensicReview: (id: string) => void;
 }
 
 export const IncidentDetailsModal: React.FC<IncidentDetailsModalProps> = ({
@@ -32,12 +33,13 @@ export const IncidentDetailsModal: React.FC<IncidentDetailsModalProps> = ({
   onAcknowledge,
   onResolve,
   onDispatchTeam,
+  onForensicReview,
 }) => {
+  const [viewMode, setViewMode] = useState<'isolated' | 'full'>('isolated');
   if (!incident) return null;
 
   const isCritical = incident.threatLevel === 'CRITICAL';
   const isHigh = incident.threatLevel === 'HIGH';
-  const [viewMode, setViewMode] = useState<'isolated' | 'full'>('isolated');
 
   const activeImageUrl = viewMode === 'full' && incident.fullSceneFrameUrl
     ? incident.fullSceneFrameUrl
@@ -438,7 +440,7 @@ export const IncidentDetailsModal: React.FC<IncidentDetailsModalProps> = ({
               </>
             )}
 
-            {incident.status === 'ACKNOWLEDGED' && (
+            {(incident.status === 'ACKNOWLEDGED' || incident.status === 'DISPATCHED') && (
               <button
                 onClick={() => {
                   onResolve(incident.id);
@@ -448,6 +450,19 @@ export const IncidentDetailsModal: React.FC<IncidentDetailsModalProps> = ({
               >
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 <span>Mark Threat Resolved</span>
+              </button>
+            )}
+
+            {incident.category === 'BIOMETRIC_BREACH' && incident.status !== 'FORENSIC_REVIEWED' && (
+              <button
+                onClick={() => {
+                  onForensicReview(incident.id);
+                  onClose();
+                }}
+                className="flex items-center gap-1 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition-all shadow-sm"
+              >
+                <Eye className="w-3.5 h-3.5" />
+                <span>Mark Forensic Review Complete</span>
               </button>
             )}
 

@@ -403,6 +403,16 @@ export const PersonnelDirectory: React.FC<PersonnelDirectoryProps> = ({
         keyBiometrics: extractedBiometrics?.keyBiometrics || ['Verified facial profile'],
       };
 
+      const persistenceResponse = await fetch('/api/personnel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ person: newPerson }),
+      });
+      const persistenceResult = await persistenceResponse.json().catch(() => ({}));
+      if (!persistenceResponse.ok || !persistenceResult.success) {
+        throw new Error(persistenceResult.error || 'The personnel database could not save this profile.');
+      }
+
       onAddPersonnel(newPerson);
       setIsModalOpen(false);
       setFormData({

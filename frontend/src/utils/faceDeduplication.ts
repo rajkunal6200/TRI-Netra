@@ -164,10 +164,12 @@ export function deduplicateFaces<
       const minDimension = Math.min(widthA, widthB, y2A - y1A, y2B - y1B);
       const centerDist = Math.hypot(centerAY - centerBY, centerAX - centerBX);
 
-      // True duplicate face detection criteria:
-      // High overlap (IoU > 0.65) or near-complete containment (> 0.85) with close centers.
-      // This reliably preserves distinct individuals who are standing together in the frame!
-      if (iou > 0.65 || (containment > 0.85 && centerDist < Math.max(10, minDimension * 0.35))) {
+      // Remove near-identical duplicate boxes only. Adjacent people can have
+      // overlapping face boxes, especially in group frames.
+      if (
+        (iou > 0.9 && centerDist < Math.max(8, minDimension * 0.12)) ||
+        (containment > 0.97 && centerDist < Math.max(6, minDimension * 0.08))
+      ) {
         isDuplicate = true;
         break;
       }
