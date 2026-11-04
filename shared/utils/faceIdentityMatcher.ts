@@ -5,10 +5,11 @@ export interface FaceIdentityMatch {
   similarity: number;
 }
 
-export const FACE_IDENTITY_AUTHORIZATION_THRESHOLD = 0.7;
+export const FACE_IDENTITY_AUTHORIZATION_THRESHOLD = 0.42;
+export const FACE_IDENTITY_AUTHORIZATION_MARGIN = 0.02;
 // Anything close to a registered profile remains a manual review case rather
 // than being treated as an unauthorized person on a single imperfect frame.
-export const FACE_IDENTITY_REVIEW_THRESHOLD = 0.4;
+export const FACE_IDENTITY_REVIEW_THRESHOLD = 0.34;
 
 /** Compare two Human FaceRes descriptors on the same scale used for directory matches. */
 export function faceEmbeddingSimilarity(left: FaceEmbedding | null | undefined, right: FaceEmbedding | null | undefined): number | null {
@@ -112,28 +113,35 @@ export class FaceIdentityMatcher {
   }
 
   public match(embedding: FaceEmbedding | null | undefined): FaceIdentityMatch | null {
-    const bestMatch = this.findBestMatch(embedding);
-    return bestMatch && bestMatch.similarity >= this.similarityThreshold ? bestMatch : null;
+    const [bestMatch, runnerUp] = this.findRankedMatches(embedding);
+    if (!bestMatch || bestMatch.similarity < this.similarityThreshold) return null;
+    if (runnerUp && bestMatch.similarity - runnerUp.similarity < FACE_IDENTITY_AUTHORIZATION_MARGIN) return null;
+    return bestMatch;
   }
 
   /** Return the nearest enrolled identity even when it is below the auth threshold. */
   public findBestMatch(embedding: FaceEmbedding | null | undefined): FaceIdentityMatch | null {
-    const descriptor = this.validate(embedding);
-    if (!descriptor) return null;
+    return this.findRankedMatches(embedding)[0] || null;
+  }
 
-    let bestMatch: FaceIdentityMatch | null = null;
+  private findRankedMatches(embedding: FaceEmbedding | null | undefined): FaceIdentityMatch[] {
+    const descriptor = this.validate(embedding);
+    if (!descriptor) return [];
+
+    const bestMatches = new Map<string, FaceIdentityMatch>();
     for (const [personId, references] of this.referenceEmbeddings) {
       for (const reference of references) {
         if (reference.length !== descriptor.length) continue;
 
         const similarity = faceEmbeddingSimilarity(descriptor, reference);
-        if (similarity !== null && (!bestMatch || similarity > bestMatch.similarity)) {
-          bestMatch = { personId, similarity };
+        const previous = bestMatches.get(personId);
+        if (similarity !== null && (!previous || similarity > previous.similarity)) {
+          bestMatches.set(personId, { personId, similarity });
         }
       }
     }
 
-    return bestMatch;
+    return [...bestMatches.values()].sort((left, right) => right.similarity - left.similarity);
   }
 
   private validate(embedding: FaceEmbedding | null | undefined): number[] | null {
