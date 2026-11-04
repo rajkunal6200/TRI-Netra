@@ -3,7 +3,6 @@ import type { SecurityIncident } from '@shared/types';
 const DATABASE_NAME = 'trinetra-evidence';
 const DATABASE_VERSION = 1;
 const STORE_NAME = 'incident-images';
-const MAX_INCIDENTS = 99;
 const MIN_IMAGE_REFRESH_MS = 10_000;
 
 export interface IncidentEvidenceImages {
@@ -70,10 +69,10 @@ export async function syncIncidentEvidence(incidents: SecurityIncident[]): Promi
     request.onsuccess = () => {
       const existingEntries = request.result as IncidentEvidenceImages[];
       const existingById = new Map(existingEntries.map((entry) => [entry.incidentId, entry]));
-      const retainedIds = new Set(incidents.slice(0, MAX_INCIDENTS).map((incident) => incident.id));
+      const retainedIds = new Set(incidents.map((incident) => incident.id));
       const now = Date.now();
 
-      for (const incident of incidents.slice(0, MAX_INCIDENTS)) {
+      for (const incident of incidents) {
         const face = incident.faces?.[0];
         const images: IncidentEvidenceImages = {
           incidentId: incident.id,

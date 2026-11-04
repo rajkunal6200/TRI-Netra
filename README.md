@@ -50,6 +50,8 @@ Authorized-person location sightings and daily camera transitions are saved in `
 
 The authorized personnel directory and enrolled face templates are saved in `backend/.local/personnel.json`. New registrations, directory edits, and removals are synchronized to this file and restored when the server starts. Keep it private; set `TRINETRA_PERSONNEL_FILE` to choose a different storage path.
 
+Biometric-breach and identity-review incidents are saved in `backend/.local/unauthorized-incidents.json`, with photos in the adjacent `unauthorized-evidence/` directory. The app does not expire incidents or photos by age or count; records are removed only by an explicit incident delete or **Clear Logs** action. Keep this data directory on persistent storage; set `TRINETRA_UNAUTHORIZED_INCIDENTS_FILE` to choose a different database file.
+
 ## Camera sources
 
 - **Simulation:** Runs the bundled scenarios without a camera or API key.

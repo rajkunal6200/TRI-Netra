@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
@@ -20,6 +21,11 @@ if (process.argv.includes("--development")) {
   process.env.NODE_ENV = "production";
 }
 
+// Keep persistent data anchored to the application, not whichever directory
+// happened to be current when the server process was launched. This resolves
+// to the project root in both backend/index.ts and dist/server.js.
+const applicationRootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 // Persist location sightings independently from the dev server's process
 // memory so person history remains available after an application restart.
 // Deployments can override the path; the default is a private local JSON file.
@@ -36,7 +42,8 @@ const personnelDataTempPath = `${personnelDataPath}.tmp`;
 // lives beside the JSON index so the incident list stays small and each photo
 // remains available for later dispatch or forensic review.
 const unauthorizedIncidentsPath = path.resolve(
-  process.env.TRINETRA_UNAUTHORIZED_INCIDENTS_FILE || "backend/.local/unauthorized-incidents.json"
+  process.env.TRINETRA_UNAUTHORIZED_INCIDENTS_FILE ||
+    path.join(applicationRootDirectory, "backend/.local/unauthorized-incidents.json")
 );
 const unauthorizedEvidenceDirectory = path.join(path.dirname(unauthorizedIncidentsPath), "unauthorized-evidence");
 const unauthorizedIncidentsTempPath = `${unauthorizedIncidentsPath}.tmp`;
@@ -116,8 +123,12 @@ function saveUnauthorizedEvidence(id: string, kind: "portrait" | "scene", value:
   const match = value.match(/^data:(image\/(?:jpeg|png|webp));base64,([a-z0-9+/=\s]+)$/i);
   if (!match) return undefined;
   const data = Buffer.from(match[2].replace(/\s/g, ""), "base64");
-  if (data.length === 0 || data.length > 15 * 1024 * 1024) {
-    throw new Error("Incident evidence image must be smaller than 15 MB.");
+  if (data.length === 0) return undefined;
+  if (data.length > 15 * 1024 * 1024) {
+    // Keep the incident metadata even when a camera frame is too large to
+    // retain as evidence. Oversized media must never cancel the incident save.
+    console.warn(`Skipping oversized ${kind} evidence image for an incident.`);
+    return undefined;
   }
   mkdirSync(unauthorizedEvidenceDirectory, { recursive: true, mode: 0o700 });
   const evidencePath = unauthorizedEvidencePath(id, kind);
@@ -704,8 +715,18 @@ async function startServer() {
     const existingRecord = existingIndex >= 0 ? savedUnauthorizedIncidents[existingIndex] : undefined;
     try {
       const portraitSource = candidate.croppedFaceUrl || candidate.faces?.[0]?.croppedFaceUrl || candidate.capturedFrameUrl;
-      const portraitMime = saveUnauthorizedEvidence(incident.id, "portrait", portraitSource) || existingRecord?.portraitMime;
-      const sceneMime = saveUnauthorizedEvidence(incident.id, "scene", candidate.fullSceneFrameUrl) || existingRecord?.sceneMime;
+      let portraitMime = existingRecord?.portraitMime;
+      let sceneMime = existingRecord?.sceneMime;
+      try {
+        portraitMime = saveUnauthorizedEvidence(incident.id, "portrait", portraitSource) || portraitMime;
+      } catch (error) {
+        console.warn("Could not save optional incident portrait evidence; retaining the incident record:", error instanceof Error ? error.message : error);
+      }
+      try {
+        sceneMime = saveUnauthorizedEvidence(incident.id, "scene", candidate.fullSceneFrameUrl) || sceneMime;
+      } catch (error) {
+        console.warn("Could not save optional incident scene evidence; retaining the incident record:", error instanceof Error ? error.message : error);
+      }
       const nextRecord: StoredUnauthorizedIncident = {
         incident,
         ...(portraitMime ? { portraitMime } : {}),

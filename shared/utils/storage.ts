@@ -19,35 +19,39 @@ export function safeSetItem(key: string, value: string): boolean {
     ) {
       console.warn(`LocalStorage quota reached when saving "${key}". Running cleanup...`);
       try {
-        // Remove legacy keys
-        localStorage.removeItem('sentinel_incidents');
-        localStorage.removeItem('sentinel_cameras');
-        localStorage.removeItem('sentinel_settings');
-        localStorage.removeItem('sentinel_personnel');
-
-        // Trim incidents if present
-        const incidentsJson = localStorage.getItem('trinetra_incidents');
-        if (incidentsJson) {
+        // Preserve every incident row. If the incident key is over quota,
+        // remove bulky evidence and embeddings before attempting the write;
+        // never trim records by age or count.
+        if (key === 'trinetra_incidents') {
           try {
-            const parsed = JSON.parse(incidentsJson);
+            const parsed = JSON.parse(value);
             if (Array.isArray(parsed)) {
-              // Strip capturedFrameUrl from older incidents to free space
-              const sanitized = parsed.slice(0, 10).map((inc: any) => ({
+              const compact = parsed.map((inc: any) => ({
                 ...inc,
+                identityEmbedding: undefined,
+                identityEmbeddings: undefined,
                 capturedFrameUrl: undefined,
+                croppedFaceUrl: undefined,
+                fullSceneFrameUrl: undefined,
+                faces: Array.isArray(inc.faces)
+                  ? inc.faces.map((face: any) => ({ ...face, embedding: undefined, croppedFaceUrl: undefined }))
+                  : [],
+                locationHistory: Array.isArray(inc.locationHistory)
+                  ? inc.locationHistory.map((crumb: any) => ({ ...crumb, capturedFrameUrl: undefined }))
+                  : [],
               }));
-              localStorage.setItem('trinetra_incidents', JSON.stringify(sanitized));
+              localStorage.setItem(key, JSON.stringify(compact));
+              return true;
             }
           } catch {
-            localStorage.removeItem('trinetra_incidents');
+            // Fall through to the write error below; do not erase saved rows.
           }
         }
 
-        // Try setting item again after cleanup
         localStorage.setItem(key, value);
         return true;
       } catch (retryError) {
-        console.warn(`LocalStorage write for "${key}" skipped after cleanup failed to free enough quota:`, retryError);
+        console.warn(`LocalStorage write for "${key}" skipped; no stored incident rows were deleted:`, retryError);
         return false;
       }
     }
@@ -96,11 +100,11 @@ export function sanitizeCamerasForStorage(cameras: any[]): string {
 
 /**
  * Sanitizes incidents before storing them in LocalStorage.
- * Keeps the most recent incidents and removes heavy frame base64 images.
+ * Keeps every incident row and removes heavy frame base64 images.
  */
 export function sanitizeIncidentsForStorage(incidents: any[]): string {
   try {
-    const clean = incidents.slice(0, 99).map((inc) => ({
+    const clean = incidents.map((inc) => ({
       ...inc,
       identityEmbedding: encodeFaceEmbeddingForStorage(inc.identityEmbedding),
       identityEmbeddings: Array.isArray(inc.identityEmbeddings)

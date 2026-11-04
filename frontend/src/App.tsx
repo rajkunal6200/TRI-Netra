@@ -111,9 +111,15 @@ function mergeStoredIncidents(
       ? localIncident
       : stored;
     const other = preferred === localIncident ? stored : localIncident;
+    const category = stored.category === 'BIOMETRIC_BREACH' || localIncident.category === 'BIOMETRIC_BREACH'
+      ? 'BIOMETRIC_BREACH'
+      : stored.category === 'IDENTITY_REVIEW' || localIncident.category === 'IDENTITY_REVIEW'
+      ? 'IDENTITY_REVIEW'
+      : preferred.category;
     byId.set(localIncident.id, {
       ...other,
       ...preferred,
+      category,
       capturedFrameUrl: preferred.capturedFrameUrl || other.capturedFrameUrl,
       croppedFaceUrl: preferred.croppedFaceUrl || other.croppedFaceUrl,
       fullSceneFrameUrl: preferred.fullSceneFrameUrl || other.fullSceneFrameUrl,
@@ -329,7 +335,10 @@ export default function App() {
   });
   const [incidentEvidenceReady, setIncidentEvidenceReady] = useState(false);
   const [isUnauthorizedIncidentStoreReady, setIsUnauthorizedIncidentStoreReady] = useState(false);
+  const [unauthorizedIncidentSaveRetryVersion, setUnauthorizedIncidentSaveRetryVersion] = useState(0);
   const unauthorizedIncidentSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const unauthorizedIncidentSaveRetryTimerRef = useRef<number | null>(null);
+  const unauthorizedIncidentSaveRetryAttemptRef = useRef(0);
   const unauthorizedIncidentSnapshotRef = useRef<Map<string, string>>(new Map());
   const unauthorizedIncidentEvidenceSavedAtRef = useRef<Map<string, number>>(new Map());
   const pendingUnauthorizedIncidentDeletesRef = useRef<Set<string>>(new Set());
@@ -706,6 +715,7 @@ export default function App() {
 
   useEffect(() => {
     if (!isUnauthorizedIncidentStoreReady) return;
+    let isCurrentEffect = true;
     const timer = window.setTimeout(() => {
       const now = Date.now();
       const changedIncidents = incidents
@@ -744,13 +754,37 @@ export default function App() {
             unauthorizedIncidentSnapshotRef.current.set(incident.id, metadata);
             if (includeEvidence) unauthorizedIncidentEvidenceSavedAtRef.current.set(incident.id, Date.now());
           }
+          unauthorizedIncidentSaveRetryAttemptRef.current = 0;
         })
         .catch((error: unknown) => {
           console.warn('Could not save an unauthorized incident:', error);
+          if (!isCurrentEffect) return;
+          unauthorizedIncidentSaveRetryAttemptRef.current = Math.min(
+            unauthorizedIncidentSaveRetryAttemptRef.current + 1,
+            6,
+          );
+          const retryDelay = Math.min(
+            1_000 * 2 ** (unauthorizedIncidentSaveRetryAttemptRef.current - 1),
+            30_000,
+          );
+          if (unauthorizedIncidentSaveRetryTimerRef.current !== null) {
+            window.clearTimeout(unauthorizedIncidentSaveRetryTimerRef.current);
+          }
+          unauthorizedIncidentSaveRetryTimerRef.current = window.setTimeout(() => {
+            unauthorizedIncidentSaveRetryTimerRef.current = null;
+            setUnauthorizedIncidentSaveRetryVersion((version) => version + 1);
+          }, retryDelay);
         });
     }, 800);
-    return () => window.clearTimeout(timer);
-  }, [incidents, isUnauthorizedIncidentStoreReady]);
+    return () => {
+      isCurrentEffect = false;
+      window.clearTimeout(timer);
+      if (unauthorizedIncidentSaveRetryTimerRef.current !== null) {
+        window.clearTimeout(unauthorizedIncidentSaveRetryTimerRef.current);
+        unauthorizedIncidentSaveRetryTimerRef.current = null;
+      }
+    };
+  }, [incidents, isUnauthorizedIncidentStoreReady, unauthorizedIncidentSaveRetryVersion]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1095,6 +1129,11 @@ export default function App() {
               const wasPreviouslyUnauthorized = existing.category === 'BIOMETRIC_BREACH' || existing.faces.some((priorFace) =>
                 priorFace.status === 'UNAUTHORIZED'
               );
+              const wasPreviouslyIdentityReview = !wasPreviouslyUnauthorized && (
+                existing.category === 'IDENTITY_REVIEW' || existing.faces.some((priorFace) =>
+                  priorFace.status === 'UNKNOWN' || priorFace.status === 'SUSPICIOUS'
+                )
+              );
               const newCount = (existing.sightingsCount || 1) + 1;
               
               // Track breadcrumb trail across all camera locations
@@ -1199,6 +1238,8 @@ export default function App() {
                 ...rememberIncidentIdentityEmbedding(existing, face.embedding),
                 category: wasPreviouslyUnauthorized
                   ? 'BIOMETRIC_BREACH'
+                  : wasPreviouslyIdentityReview
+                  ? 'IDENTITY_REVIEW'
                   : isIdentityReview
                   ? 'IDENTITY_REVIEW'
                   : face.status === 'AUTHORIZED'
@@ -1208,6 +1249,8 @@ export default function App() {
                   ? `This person was previously recorded as unauthorized. A later scan matched ${subjectLabel} in the authorized directory. The original incident is retained for operator review.`
                   : wasPreviouslyUnauthorized && isIdentityReview
                   ? `This person was previously recorded as unauthorized. The latest face image is unclear, so the original incident remains open for operator review.`
+                  : wasPreviouslyIdentityReview && face.status === 'AUTHORIZED'
+                  ? `This entry was created for identity review. A later scan matched ${subjectLabel} to the authorized directory. The original review is retained in the incident log for operator disposition.`
                   : isIdentityReview
                   ? `${isMultiLocation ? `This face has appeared at ${uniqueLocations.join(' ➔ ')}. ` : ''}No authorized profile matched with sufficient confidence. Manual identity review is required; unauthorized status is not confirmed.`
                   : face.status === 'AUTHORIZED'
@@ -1221,6 +1264,10 @@ export default function App() {
                     : isIdentityReview
                     ? `⚠️ Prior Unauthorized Detection · Review Required`
                     : `⚠️ Unauthorized Person on ${camLabel}`
+                  : wasPreviouslyIdentityReview
+                  ? face.status === 'AUTHORIZED'
+                    ? `🔎 Identity Review · Later Matched: ${subjectLabel} on ${camLabel}`
+                    : `🔎 Identity Review: ${subjectLabel} on ${camLabel}`
                   : isIdentityReview
                   ? `🔎 Identity Review: ${subjectLabel} on ${camLabel}`
                   : face.status === 'AUTHORIZED'
@@ -1230,7 +1277,7 @@ export default function App() {
                   : totalSubjects > 1
                   ? `⚠️ ${subjectLabel} on ${camLabel} (Seen ${newCount}x)`
                   : `⚠️ Unregistered Face on ${camLabel} (Seen ${newCount}x)`,
-                status: wasPreviouslyUnauthorized
+                status: wasPreviouslyUnauthorized || wasPreviouslyIdentityReview
                   ? existing.status
                   : face.status === 'AUTHORIZED' ? 'RESOLVED' : 'ACTIVE',
                 faces: [incidentFace],
